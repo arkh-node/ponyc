@@ -1,6 +1,7 @@
 use "files"
 use "pony_test"
 use "promises"
+use "signals"
 use "time"
 
 actor \nodoc\ Main is TestList
@@ -236,7 +237,7 @@ class \nodoc\ iso _TestANSITermCSINavigation is UnitTest
       ["up 000"; "down 000"; "right 000"; "left 000"; "home 000"; "end 000"]
     end
     let timers = Timers
-    let term = ANSITerm(_RecordNotify(h, expected), _NullSource, timers)
+    let term = ANSITerm(SignalAuth(h.env.root), _RecordNotify(h, expected), _NullSource, timers)
     h.dispose_when_done(term)
     h.dispose_when_done(timers)
     h.long_test(2_000_000_000)
@@ -256,7 +257,7 @@ class \nodoc\ iso _TestANSITermPassthrough is UnitTest
       ["byte 97"; "byte 98"; "up 000"; "byte 99"]
     end
     let timers = Timers
-    let term = ANSITerm(_RecordNotify(h, expected), _NullSource, timers)
+    let term = ANSITerm(SignalAuth(h.env.root), _RecordNotify(h, expected), _NullSource, timers)
     h.dispose_when_done(term)
     h.dispose_when_done(timers)
     h.long_test(2_000_000_000)
@@ -276,7 +277,7 @@ class \nodoc\ iso _TestANSITermSS3Navigation is UnitTest
         "fn1 000"; "fn2 000"; "fn3 000"; "fn4 000" ]
     end
     let timers = Timers
-    let term = ANSITerm(_RecordNotify(h, expected), _NullSource, timers)
+    let term = ANSITerm(SignalAuth(h.env.root), _RecordNotify(h, expected), _NullSource, timers)
     h.dispose_when_done(term)
     h.dispose_when_done(timers)
     h.long_test(2_000_000_000)
@@ -296,7 +297,7 @@ class \nodoc\ iso _TestANSITermKeypad is UnitTest
         "page_down 000" ]
     end
     let timers = Timers
-    let term = ANSITerm(_RecordNotify(h, expected), _NullSource, timers)
+    let term = ANSITerm(SignalAuth(h.env.root), _RecordNotify(h, expected), _NullSource, timers)
     h.dispose_when_done(term)
     h.dispose_when_done(timers)
     h.long_test(2_000_000_000)
@@ -318,7 +319,7 @@ class \nodoc\ iso _TestANSITermFunctionKeys is UnitTest
         "fn19 000"; "fn20 000" ]
     end
     let timers = Timers
-    let term = ANSITerm(_RecordNotify(h, expected), _NullSource, timers)
+    let term = ANSITerm(SignalAuth(h.env.root), _RecordNotify(h, expected), _NullSource, timers)
     h.dispose_when_done(term)
     h.dispose_when_done(timers)
     h.long_test(2_000_000_000)
@@ -345,7 +346,7 @@ class \nodoc\ iso _TestANSITermModifiers is UnitTest
         "up 000"; "up 000"; "delete 100" ]
     end
     let timers = Timers
-    let term = ANSITerm(_RecordNotify(h, expected), _NullSource, timers)
+    let term = ANSITerm(SignalAuth(h.env.root), _RecordNotify(h, expected), _NullSource, timers)
     h.dispose_when_done(term)
     h.dispose_when_done(timers)
     h.long_test(2_000_000_000)
@@ -363,7 +364,7 @@ class \nodoc\ iso _TestANSITermAltWord is UnitTest
   fun ref apply(h: TestHelper) =>
     let expected = recover val ["left 010"; "right 010"] end
     let timers = Timers
-    let term = ANSITerm(_RecordNotify(h, expected), _NullSource, timers)
+    let term = ANSITerm(SignalAuth(h.env.root), _RecordNotify(h, expected), _NullSource, timers)
     h.dispose_when_done(term)
     h.dispose_when_done(timers)
     h.long_test(2_000_000_000)
@@ -388,7 +389,7 @@ class \nodoc\ iso _TestANSITermUnrecognizedEscape is UnitTest
       [ "byte 89" ]
     end
     let timers = Timers
-    let term = ANSITerm(_RecordNotify(h, expected), _NullSource, timers)
+    let term = ANSITerm(SignalAuth(h.env.root), _RecordNotify(h, expected), _NullSource, timers)
     h.dispose_when_done(term)
     h.dispose_when_done(timers)
     h.long_test(2_000_000_000)
@@ -408,7 +409,7 @@ class \nodoc\ iso _TestANSITermUnknownKeypad is UnitTest
     // following ESC[3~ decodes cleanly.
     let expected = recover val ["byte 120"; "delete 000"] end
     let timers = Timers
-    let term = ANSITerm(_RecordNotify(h, expected), _NullSource, timers)
+    let term = ANSITerm(SignalAuth(h.env.root), _RecordNotify(h, expected), _NullSource, timers)
     h.dispose_when_done(term)
     h.dispose_when_done(timers)
     h.long_test(2_000_000_000)
@@ -428,7 +429,7 @@ class \nodoc\ iso _TestANSITermParamOverflow is UnitTest
     // ESC[1;258A: 258 would wrap to 2 (shift); clamped, it is no modifiers.
     let expected = recover val ["up 000"] end
     let timers = Timers
-    let term = ANSITerm(_RecordNotify(h, expected), _NullSource, timers)
+    let term = ANSITerm(SignalAuth(h.env.root), _RecordNotify(h, expected), _NullSource, timers)
     h.dispose_when_done(term)
     h.dispose_when_done(timers)
     h.long_test(2_000_000_000)
@@ -448,7 +449,7 @@ class \nodoc\ iso _TestANSITermPrivateParam is UnitTest
     // fire up; the sequence is discarded and the trailing 'x' passes through.
     let expected = recover val ["byte 120"] end
     let timers = Timers
-    let term = ANSITerm(_RecordNotify(h, expected), _NullSource, timers)
+    let term = ANSITerm(SignalAuth(h.env.root), _RecordNotify(h, expected), _NullSource, timers)
     h.dispose_when_done(term)
     h.dispose_when_done(timers)
     h.long_test(2_000_000_000)
@@ -472,7 +473,7 @@ class \nodoc\ iso _TestANSITermControlAbort is UnitTest
       ["byte 13"; "up 000"; "byte 13"; "up 000"]
     end
     let timers = Timers
-    let term = ANSITerm(_RecordNotify(h, expected), _NullSource, timers)
+    let term = ANSITerm(SignalAuth(h.env.root), _RecordNotify(h, expected), _NullSource, timers)
     h.dispose_when_done(term)
     h.dispose_when_done(timers)
     h.long_test(2_000_000_000)
@@ -490,7 +491,7 @@ class \nodoc\ iso _TestANSITermTimeoutFlush is UnitTest
   fun ref apply(h: TestHelper) =>
     let expected = recover val ["byte 27"; "byte 27"; "byte 91"] end
     let timers = Timers
-    let term = ANSITerm(_RecordNotify(h, expected), _NullSource, timers)
+    let term = ANSITerm(SignalAuth(h.env.root), _RecordNotify(h, expected), _NullSource, timers)
     h.dispose_when_done(term)
     h.dispose_when_done(timers)
     h.long_test(2_000_000_000)
@@ -510,7 +511,7 @@ class \nodoc\ iso _TestANSITermRealTimerFlush is UnitTest
 
   fun ref apply(h: TestHelper) =>
     let timers = Timers
-    let term = ANSITerm(_FlushNotify(h), _NullSource, timers)
+    let term = ANSITerm(SignalAuth(h.env.root), _FlushNotify(h), _NullSource, timers)
     h.dispose_when_done(term)
     h.dispose_when_done(timers)
     h.long_test(2_000_000_000)
@@ -525,7 +526,7 @@ class \nodoc\ iso _TestANSITermDispose is UnitTest
 
   fun ref apply(h: TestHelper) =>
     let timers = Timers
-    let term = ANSITerm(_DisposeNotify(h), _NullSource, timers)
+    let term = ANSITerm(SignalAuth(h.env.root), _DisposeNotify(h), _NullSource, timers)
     h.dispose_when_done(term)
     h.dispose_when_done(timers)
     h.long_test(2_000_000_000)
@@ -561,7 +562,7 @@ class \nodoc\ iso _TestANSITermPromptForward is UnitTest
 
   fun ref apply(h: TestHelper) =>
     let timers = Timers
-    let term = ANSITerm(_PromptNotify(h, "PS> "), _NullSource, timers)
+    let term = ANSITerm(SignalAuth(h.env.root), _PromptNotify(h, "PS> "), _NullSource, timers)
     h.dispose_when_done(term)
     h.dispose_when_done(timers)
     h.long_test(2_000_000_000)
@@ -577,7 +578,7 @@ class \nodoc\ iso _TestANSITermSize is UnitTest
 
   fun ref apply(h: TestHelper) =>
     let timers = Timers
-    let term = ANSITerm(_SizeNotify(h), _NullSource, timers)
+    let term = ANSITerm(SignalAuth(h.env.root), _SizeNotify(h), _NullSource, timers)
     h.dispose_when_done(term)
     h.dispose_when_done(timers)
     h.long_test(2_000_000_000)
@@ -715,7 +716,7 @@ class \nodoc\ iso _TestANSIColors is UnitTest
 //
 // Readline can only be exercised through a real ANSITerm: its input methods
 // take an `ANSITerm ref` that exists only inside the actor. So each test builds
-// `ANSITerm(Readline(notify, out, ...), source, timers)` and drives it with
+// `ANSITerm(auth, Readline(notify, out, ...), source, timers)` and drives it with
 // `term.apply(bytes)`. Observation is through the injected ReadlineNotify (the
 // dispatched line) and, for the synchronous history tests, the history file.
 // ---------------------------------------------------------------------------
@@ -1015,7 +1016,7 @@ class \nodoc\ iso _TestReadlineCtrlKRefresh is UnitTest
     // A redraw of the buffer "a" writes "a" followed by the erase-to-end code.
     let out = _MatchOut("a" + ANSI.erase())
     let timers = Timers
-    let term = ANSITerm(Readline(_MatchNotify(h, out, 2), out), _NullSource,
+    let term = ANSITerm(SignalAuth(h.env.root), Readline(_MatchNotify(h, out, 2), out), _NullSource,
       timers)
     h.dispose_when_done(term)
     h.dispose_when_done(timers)
@@ -1038,7 +1039,7 @@ class \nodoc\ iso _TestReadlineEmptyLineCursor is UnitTest
   fun ref apply(h: TestHelper) =>
     let out = _MatchOut(ANSI.right(0)) // "\x1B[C"
     let timers = Timers
-    let term = ANSITerm(Readline(_MatchNotify(h, out, 1), out), _NullSource,
+    let term = ANSITerm(SignalAuth(h.env.root), Readline(_MatchNotify(h, out, 1), out), _NullSource,
       timers)
     h.dispose_when_done(term)
     h.dispose_when_done(timers)
@@ -1070,7 +1071,7 @@ primitive \nodoc\ _DriveReadline
   fun apply(h: TestHelper, steps: Array[(String, String)] val) =>
     let timers = Timers
     let driver = _ReadlineDriver(h, steps)
-    let term = ANSITerm(Readline(_DriverNotify(driver), _NullOut), _NullSource,
+    let term = ANSITerm(SignalAuth(h.env.root), Readline(_DriverNotify(driver), _NullOut), _NullSource,
       timers)
     h.dispose_when_done(term)
     h.dispose_when_done(timers)
@@ -1087,7 +1088,7 @@ class \nodoc\ iso _TestReadlineBlockedQueue is UnitTest
   fun ref apply(h: TestHelper) =>
     let expected = recover val ["one"; "two"] end
     let timers = Timers
-    let term = ANSITerm(Readline(_ScriptNotify(h, expected), _NullOut),
+    let term = ANSITerm(SignalAuth(h.env.root), Readline(_ScriptNotify(h, expected), _NullOut),
       _NullSource, timers)
     h.dispose_when_done(term)
     h.dispose_when_done(timers)
@@ -1106,7 +1107,7 @@ class \nodoc\ iso _TestReadlineCtrlDEmptyDisposes is UnitTest
 
   fun ref apply(h: TestHelper) =>
     let timers = Timers
-    let term = ANSITerm(
+    let term = ANSITerm(SignalAuth(h.env.root),
       Readline(_NullReadlineNotify, _NullOut), _DisposeProbe(h), timers)
     h.dispose_when_done(term)
     h.dispose_when_done(timers)
@@ -1122,7 +1123,7 @@ class \nodoc\ iso _TestReadlineRejectDisposes is UnitTest
 
   fun ref apply(h: TestHelper) =>
     let timers = Timers
-    let term = ANSITerm(Readline(_RejectNotify, _NullOut), _DisposeProbe(h),
+    let term = ANSITerm(SignalAuth(h.env.root), Readline(_RejectNotify, _NullOut), _DisposeProbe(h),
       timers)
     h.dispose_when_done(term)
     h.dispose_when_done(timers)
@@ -1149,7 +1150,7 @@ class \nodoc\ iso _TestReadlineHistoryNavigation is UnitTest
     let path = dir.join("history")?
     _HistoryFile.write(path, ["alpha"; "beta"; "gamma"])
     let timers = Timers
-    let term = ANSITerm(Readline(_LineNotify(h, "beta"), _NullOut, path),
+    let term = ANSITerm(SignalAuth(h.env.root), Readline(_LineNotify(h, "beta"), _NullOut, path),
       _NullSource, timers)
     h.dispose_when_done(term)
     h.dispose_when_done(timers)
@@ -1175,7 +1176,7 @@ class \nodoc\ iso _TestReadlineDownEmptyHistory is UnitTest
 
   fun ref apply(h: TestHelper) =>
     let timers = Timers
-    let term = ANSITerm(Readline(_LineNotify(h, "abcd"), _NullOut), _NullSource,
+    let term = ANSITerm(SignalAuth(h.env.root), Readline(_LineNotify(h, "abcd"), _NullOut), _NullSource,
       timers)
     h.dispose_when_done(term)
     h.dispose_when_done(timers)
@@ -1264,7 +1265,7 @@ class \nodoc\ iso _TestReadlineTabNone is UnitTest
   fun ref apply(h: TestHelper) =>
     let timers = Timers
     let notify = _LineNotify(h, "ab" where tab_input = "ab")
-    let term = ANSITerm(Readline(consume notify, _NullOut), _NullSource, timers)
+    let term = ANSITerm(SignalAuth(h.env.root), Readline(consume notify, _NullOut), _NullSource, timers)
     h.dispose_when_done(term)
     h.dispose_when_done(timers)
     h.long_test(5_000_000_000)
@@ -1280,7 +1281,7 @@ class \nodoc\ iso _TestReadlineTabSingle is UnitTest
   fun ref apply(h: TestHelper) =>
     let timers = Timers
     let notify = _LineNotify(h, "hello", ["hello"] where tab_input = "h")
-    let term = ANSITerm(Readline(consume notify, _NullOut), _NullSource, timers)
+    let term = ANSITerm(SignalAuth(h.env.root), Readline(consume notify, _NullOut), _NullSource, timers)
     h.dispose_when_done(term)
     h.dispose_when_done(timers)
     h.long_test(5_000_000_000)
@@ -1296,7 +1297,7 @@ class \nodoc\ iso _TestReadlineTabCommonPrefix is UnitTest
   fun ref apply(h: TestHelper) =>
     let timers = Timers
     let notify = _LineNotify(h, "hel", ["hello"; "help"] where tab_input = "h")
-    let term = ANSITerm(Readline(consume notify, _NullOut), _NullSource, timers)
+    let term = ANSITerm(SignalAuth(h.env.root), Readline(consume notify, _NullOut), _NullSource, timers)
     h.dispose_when_done(term)
     h.dispose_when_done(timers)
     h.long_test(5_000_000_000)
