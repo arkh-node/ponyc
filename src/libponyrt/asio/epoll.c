@@ -608,7 +608,7 @@ PONY_API void pony_asio_event_subscribe(asio_event_t* ev)
   {
     if(ev->nsec >= MAX_SIGNAL)
     {
-      // Out of range (only reachable through raw FFI — ValidSignal caps
+      // Out of range (only reachable through raw FFI — HandleableSignal caps
       // well below MAX_SIGNAL). Report it so the handler auto-disposes
       // instead of stranding, per the documented contract.
       pony_asio_event_send(ev, ASIO_ERROR, SIGNAL_ERR_REFUSED);

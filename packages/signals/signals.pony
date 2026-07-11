@@ -19,7 +19,7 @@ Signal handling requires a `SignalAuth` capability derived from `AmbientAuth`,
 consistent with how other I/O primitives in the standard library handle
 resource access.
 
-Signal numbers must be validated through `MakeValidSignal` before they can
+Signal numbers must be validated through `MakeHandleableSignal` before they can
 be used with `SignalHandler`. Validation is a per-platform whitelist of
 signals that can be meaningfully handled via the ASIO mechanism: it rejects
 fatal signals (SIGILL, SIGTRAP, SIGABRT, SIGFPE, SIGBUS, SIGSEGV),
@@ -37,8 +37,8 @@ actor Main
   new create(env: Env) =>
     let auth = SignalAuth(env.root)
 
-    match MakeValidSignal(Sig.term())
-    | let sig: ValidSignal =>
+    match MakeHandleableSignal(Sig.term())
+    | let sig: HandleableSignal =>
       // Multiple handlers for the same signal
       SignalHandler(auth, LogHandler(env.out), sig)
       SignalHandler(auth, CleanupHandler(env.out), sig where wait = true)
@@ -79,7 +79,7 @@ for `SIGINT`) work, while platform-specific accessors (for example
 `Sig.trap()`) raise a compile error there. A few platform-independent
 accessors (such as `Sig.hup()`) compile on Windows but name signals it does
 not have. Validation resolves this: on Windows only `Sig.int()` and
-`Sig.term()` are accepted by `MakeValidSignal` — everything else, including
+`Sig.term()` are accepted by `MakeHandleableSignal` — everything else, including
 signals the C runtime knows about but treats as fatal (such as `SIGABRT`),
 is rejected.
 

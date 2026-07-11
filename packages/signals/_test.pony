@@ -13,11 +13,11 @@ actor \nodoc\ Main is TestList
     // raised signal missing from those lists stops the debugger on the first
     // delivery and kills the whole leg, while the tests keep passing
     // everywhere else. This suite raises SIGINT, SIGTERM, and SIGUSR2.
-    test(_TestValidSignalAcceptsHandleable)
-    test(_TestValidSignalRejectsFatal)
-    test(_TestValidSignalRejectsUncatchable)
-    test(_TestValidSignalRejectsUnknown)
-    test(_TestValidSignalRTBoundaries)
+    test(_TestHandleableSignalAccepts)
+    test(_TestHandleableSignalRejectsFatal)
+    test(_TestHandleableSignalRejectsUncatchable)
+    test(_TestHandleableSignalRejectsUnknown)
+    test(_TestHandleableSignalRTBoundaries)
     test(_TestSignalINT)
     // SIGUSR2 is a compile error except on scheduler_scaling_pthreads builds
     // off Windows, where the runtime frees it; register the test only there.
@@ -35,12 +35,12 @@ actor \nodoc\ Main is TestList
     test(_TestNotifyReturnsFalse)
     test(_TestSubscriberLimit)
 
-class \nodoc\ iso _TestValidSignalAcceptsHandleable is UnitTest
+class \nodoc\ iso _TestHandleableSignalAccepts is UnitTest
   """
-  Verify that the enumerated handleable signals pass SignalValidator.
+  Verify that the enumerated handleable signals pass HandleableSignalValidator.
   (The real-time ranges are pinned separately by the RT boundaries test.)
   """
-  fun name(): String => "signals/ValidSignal accepts handleable"
+  fun name(): String => "signals/HandleableSignal accepts handleable"
 
   fun apply(h: TestHelper) =>
     ifdef linux then
@@ -95,17 +95,17 @@ class \nodoc\ iso _TestValidSignalAcceptsHandleable is UnitTest
     end
 
   fun _assert_valid(h: TestHelper, sig: U32) =>
-    match MakeValidSignal(sig)
-    | let _: ValidSignal => None
+    match MakeHandleableSignal(sig)
+    | let _: HandleableSignal => None
     | let _: ValidationFailure =>
       h.fail("signal " + sig.string() + " should be valid")
     end
 
-class \nodoc\ iso _TestValidSignalRejectsFatal is UnitTest
+class \nodoc\ iso _TestHandleableSignalRejectsFatal is UnitTest
   """
-  Verify that fatal signals are rejected by SignalValidator.
+  Verify that fatal signals are rejected by HandleableSignalValidator.
   """
-  fun name(): String => "signals/ValidSignal rejects fatal"
+  fun name(): String => "signals/HandleableSignal rejects fatal"
 
   fun apply(h: TestHelper) =>
     ifdef linux or bsd or osx then
@@ -127,17 +127,17 @@ class \nodoc\ iso _TestValidSignalRejectsFatal is UnitTest
     end
 
   fun _assert_invalid(h: TestHelper, sig: U32) =>
-    match MakeValidSignal(sig)
-    | let _: ValidSignal =>
+    match MakeHandleableSignal(sig)
+    | let _: HandleableSignal =>
       h.fail("signal " + sig.string() + " should be rejected (fatal)")
     | let _: ValidationFailure => None
     end
 
-class \nodoc\ iso _TestValidSignalRejectsUncatchable is UnitTest
+class \nodoc\ iso _TestHandleableSignalRejectsUncatchable is UnitTest
   """
-  Verify that uncatchable signals are rejected by SignalValidator.
+  Verify that uncatchable signals are rejected by HandleableSignalValidator.
   """
-  fun name(): String => "signals/ValidSignal rejects uncatchable"
+  fun name(): String => "signals/HandleableSignal rejects uncatchable"
 
   fun apply(h: TestHelper) =>
     ifdef linux or bsd or osx then
@@ -148,17 +148,17 @@ class \nodoc\ iso _TestValidSignalRejectsUncatchable is UnitTest
     end
 
   fun _assert_invalid(h: TestHelper, sig: U32) =>
-    match MakeValidSignal(sig)
-    | let _: ValidSignal =>
+    match MakeHandleableSignal(sig)
+    | let _: HandleableSignal =>
       h.fail("signal " + sig.string() + " should be rejected (uncatchable)")
     | let _: ValidationFailure => None
     end
 
-class \nodoc\ iso _TestValidSignalRejectsUnknown is UnitTest
+class \nodoc\ iso _TestHandleableSignalRejectsUnknown is UnitTest
   """
   Verify that arbitrary unknown signal numbers are rejected.
   """
-  fun name(): String => "signals/ValidSignal rejects unknown"
+  fun name(): String => "signals/HandleableSignal rejects unknown"
 
   fun apply(h: TestHelper) =>
     _assert_invalid(h, 0)
@@ -173,20 +173,20 @@ class \nodoc\ iso _TestValidSignalRejectsUnknown is UnitTest
     end
 
   fun _assert_invalid(h: TestHelper, sig: U32) =>
-    match MakeValidSignal(sig)
-    | let _: ValidSignal =>
+    match MakeHandleableSignal(sig)
+    | let _: HandleableSignal =>
       h.fail("signal " + sig.string() + " should be rejected (unknown)")
     | let _: ValidationFailure => None
     end
 
-class \nodoc\ iso _TestValidSignalRTBoundaries is UnitTest
+class \nodoc\ iso _TestHandleableSignalRTBoundaries is UnitTest
   """
   Pin the real-time signal ranges at their boundaries: the first and last
   in-range values validate and the values just outside do not. Uses Sig.rt
   for the in-range values so a desync between Sig.rt's range and
-  SignalValidator's is caught from either side.
+  HandleableSignalValidator's is caught from either side.
   """
-  fun name(): String => "signals/ValidSignal RT boundaries"
+  fun name(): String => "signals/HandleableSignal RT boundaries"
 
   fun apply(h: TestHelper) =>
     ifdef linux then
@@ -212,15 +212,15 @@ class \nodoc\ iso _TestValidSignalRTBoundaries is UnitTest
     end
 
   fun _assert_valid(h: TestHelper, sig: U32) =>
-    match MakeValidSignal(sig)
-    | let _: ValidSignal => None
+    match MakeHandleableSignal(sig)
+    | let _: HandleableSignal => None
     | let _: ValidationFailure =>
       h.fail("signal " + sig.string() + " should be valid")
     end
 
   fun _assert_invalid(h: TestHelper, sig: U32) =>
-    match MakeValidSignal(sig)
-    | let _: ValidSignal =>
+    match MakeHandleableSignal(sig)
+    | let _: HandleableSignal =>
       h.fail("signal " + sig.string() + " should be rejected (out of range)")
     | let _: ValidationFailure => None
     end
@@ -243,8 +243,8 @@ class \nodoc\ iso _TestSignalINT is UnitTest
 
   fun ref apply(h: TestHelper) =>
     let auth = SignalAuth(h.env.root)
-    match MakeValidSignal(Sig.int())
-    | let sig: ValidSignal =>
+    match MakeHandleableSignal(Sig.int())
+    | let sig: HandleableSignal =>
       let signal = SignalHandler(auth, _TestSignalNotify(h), sig)
       signal.raise(auth)
       _signal = signal
@@ -269,13 +269,13 @@ class \nodoc\ iso _TestSignalUSR2 is UnitTest
 
   fun ref apply(h: TestHelper) =>
     // Gated to match the registration in tests() and the whitelist in
-    // SignalValidator: the runtime frees SIGUSR2 only on
+    // HandleableSignalValidator: the runtime frees SIGUSR2 only on
     // scheduler_scaling_pthreads builds, and it exists only off Windows, so
     // that is where Sig.usr2() yields a usable signal number.
     ifdef "scheduler_scaling_pthreads" and not windows then
       let auth = SignalAuth(h.env.root)
-      match MakeValidSignal(Sig.usr2())
-      | let sig: ValidSignal =>
+      match MakeHandleableSignal(Sig.usr2())
+      | let sig: HandleableSignal =>
         let signal = SignalHandler(auth, _TestSignalNotify(h), sig)
         signal.raise(auth)
         _signal = signal
@@ -358,8 +358,8 @@ class \nodoc\ iso _TestMultipleHandlers is UnitTest
     let auth = SignalAuth(h.env.root)
     h.expect_action("handler1")
     h.expect_action("handler2")
-    match MakeValidSignal(Sig.int())
-    | let sig: ValidSignal =>
+    match MakeHandleableSignal(Sig.int())
+    | let sig: HandleableSignal =>
       let s2 = SignalHandler(auth,
         _TestMultiHandlerNotify(h, "handler2"), sig)
       let s1 = SignalHandler(auth,
@@ -413,8 +413,8 @@ class \nodoc\ iso _TestDispose is UnitTest
 
   fun ref apply(h: TestHelper) =>
     let auth = SignalAuth(h.env.root)
-    match MakeValidSignal(Sig.int())
-    | let sig: ValidSignal =>
+    match MakeHandleableSignal(Sig.int())
+    | let sig: HandleableSignal =>
       let signal = SignalHandler(auth, _TestDisposeNotify(h), sig)
       signal.dispose(auth)
       h.long_test(10_000_000_000)
@@ -464,8 +464,8 @@ class \nodoc\ iso _TestDisposeRestoresDefaultDisposition is UnitTest
 
   fun ref apply(h: TestHelper) =>
     let auth = SignalAuth(h.env.root)
-    match MakeValidSignal(Sig.term())
-    | let sig: ValidSignal =>
+    match MakeHandleableSignal(Sig.term())
+    | let sig: HandleableSignal =>
       let signal = SignalHandler(auth, _DispositionProbeNotify(h), sig)
       signal.dispose(auth)
       h.long_test(10_000_000_000)
@@ -500,8 +500,8 @@ class \nodoc\ iso _TestNotifyReturnsFalse is UnitTest
 
   fun ref apply(h: TestHelper) =>
     let auth = SignalAuth(h.env.root)
-    match MakeValidSignal(Sig.int())
-    | let sig: ValidSignal =>
+    match MakeHandleableSignal(Sig.int())
+    | let sig: HandleableSignal =>
       let signal = SignalHandler(auth, _TestReturnsFalseNotify(h), sig)
       signal.raise(auth)
       _signal = signal
@@ -628,12 +628,12 @@ actor \nodoc\ _SubscriberLimitCoordinator
   """
   let _h: TestHelper
   let _auth: SignalAuth
-  let _sig: ValidSignal
+  let _sig: HandleableSignal
   let _handlers: Array[SignalHandler] = Array[SignalHandler](18)
   var _registered: USize = 0
   var _stopped: Bool = false
 
-  new create(h: TestHelper, auth: SignalAuth, sig: ValidSignal) =>
+  new create(h: TestHelper, auth: SignalAuth, sig: HandleableSignal) =>
     _h = h
     _auth = auth
     _sig = sig
@@ -720,8 +720,8 @@ class \nodoc\ iso _TestSubscriberLimit is UnitTest
 
   fun ref apply(h: TestHelper) =>
     let auth = SignalAuth(h.env.root)
-    match MakeValidSignal(Sig.term())
-    | let sig: ValidSignal =>
+    match MakeHandleableSignal(Sig.term())
+    | let sig: HandleableSignal =>
       // Declare every expected action before any handler exists so no
       // completion can be lost.
       var i: USize = 1
@@ -794,8 +794,8 @@ class \nodoc\ iso _TestOSRefusedRegistration is UnitTest
     ifdef linux then
       let auth = SignalAuth(h.env.root)
       try
-        match MakeValidSignal(Sig.rt(0)?)
-        | let sig: ValidSignal =>
+        match MakeHandleableSignal(Sig.rt(0)?)
+        | let sig: HandleableSignal =>
           h.expect_action("refused-1")
           h.expect_action("refused-2")
           SignalHandler(auth, _RefusedNotify(h, "refused-1"), sig)

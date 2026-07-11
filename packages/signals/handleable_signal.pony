@@ -1,6 +1,6 @@
 use "constrained_types"
 
-primitive SignalValidator is Validator[U32]
+primitive HandleableSignalValidator is Validator[U32]
   """
   Validates that a signal number is handleable via the ASIO mechanism.
 
@@ -94,14 +94,14 @@ primitive SignalValidator is Validator[U32]
       false
     end
 
-type ValidSignal is Constrained[U32, SignalValidator]
+type HandleableSignal is Constrained[U32, HandleableSignalValidator]
   """
   A signal number that has been validated as handleable on this platform.
-  Required by `SignalHandler`; obtain one from `MakeValidSignal`.
+  Required by `SignalHandler`; obtain one from `MakeHandleableSignal`.
   """
 
-type MakeValidSignal is MakeConstrained[U32, SignalValidator]
+type MakeHandleableSignal is MakeConstrained[U32, HandleableSignalValidator]
   """
-  Factory for `ValidSignal` instances. Returns either a `ValidSignal` or a
-  `ValidationFailure` with an error message.
+  Factory for `HandleableSignal` instances. Returns either a `HandleableSignal`
+  or a `ValidationFailure` with an error message.
   """

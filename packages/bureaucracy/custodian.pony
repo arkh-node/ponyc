@@ -36,8 +36,8 @@ actor Custodian
       custodian(actor3)
 
       let auth = SignalAuth(env.root)
-      match MakeValidSignal(Sig.term())
-      | let sig: ValidSignal =>
+      match MakeHandleableSignal(Sig.term())
+      | let sig: HandleableSignal =>
         SignalHandler(auth, TermHandler(custodian), sig)
       end
 

@@ -27,7 +27,8 @@ typedef struct scheduler_t scheduler_t;
 // Signal to use for suspending/resuming threads via `sigwait`/`pthread_kill`
 // If you change this, change the `signals` package accordingly. Two gates there
 // mirror this reservation, and both must move together: `Sig.usr2()` in
-// sig.pony, and `SignalValidator._usr2_handleable` in valid_signal.pony.
+// sig.pony, and `HandleableSignalValidator._usr2_handleable` in
+// handleable_signal.pony.
 #define PONY_SCHED_SLEEP_WAKE_SIGNAL SIGUSR2
 #endif
 

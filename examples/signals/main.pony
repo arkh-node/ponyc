@@ -21,7 +21,7 @@ actor Main
   """
   Demonstrates the signals package:
   - Creating a SignalAuth capability from AmbientAuth
-  - Validating signal numbers with MakeValidSignal
+  - Validating signal numbers with MakeHandleableSignal
   - Registering multiple handlers for the same signal
   - Raising a signal programmatically
   - Unsubscribing by returning false from a notify's apply
@@ -41,8 +41,8 @@ actor Main
   new create(env: Env) =>
     let auth = SignalAuth(env.root)
 
-    match MakeValidSignal(Sig.int())
-    | let sig: ValidSignal =>
+    match MakeHandleableSignal(Sig.int())
+    | let sig: HandleableSignal =>
       let h1 =
         SignalHandler(auth, Handler(env, "handler-1"), sig where wait = true)
       let h2 = SignalHandler(auth, Handler(env, "handler-2"), sig)

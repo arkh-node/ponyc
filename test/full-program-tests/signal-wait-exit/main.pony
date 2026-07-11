@@ -26,8 +26,8 @@ class _ExitNotify is SignalNotify
 actor Main
   new create(env: Env) =>
     let auth = SignalAuth(env.root)
-    match MakeValidSignal(Sig.int())
-    | let sig: ValidSignal =>
+    match MakeHandleableSignal(Sig.int())
+    | let sig: HandleableSignal =>
       let handler =
         SignalHandler(auth, _ExitNotify(env), sig where wait = true)
       handler.raise(auth)

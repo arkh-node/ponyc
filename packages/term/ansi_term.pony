@@ -75,8 +75,8 @@ actor ANSITerm
     _auth = auth
 
     ifdef not windows then
-      match MakeValidSignal(Sig.winch())
-      | let sig: ValidSignal =>
+      match MakeHandleableSignal(Sig.winch())
+      | let sig: HandleableSignal =>
         _winch = SignalHandler(auth, recover _TermResizeNotify(this) end, sig)
       | let _: ValidationFailure =>
         // SIGWINCH is whitelisted on every platform where this branch

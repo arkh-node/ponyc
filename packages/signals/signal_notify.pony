@@ -66,7 +66,7 @@ primitive SignalRaise
   Raise a signal.
 
   Unlike SignalHandler, this accepts a raw signal number rather than a
-  ValidSignal. Raising fatal signals (e.g. SIGABRT to intentionally crash)
+  HandleableSignal. Raising fatal signals (e.g. SIGABRT to intentionally crash)
   is a legitimate operation — it is only handling them via the ASIO
   mechanism that is prevented.
 

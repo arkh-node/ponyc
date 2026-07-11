@@ -26,8 +26,8 @@ class _NoOpNotify is SignalNotify
 actor Main
   new create(env: Env) =>
     let auth = SignalAuth(env.root)
-    match MakeValidSignal(Sig.term())
-    | let sig: ValidSignal =>
+    match MakeHandleableSignal(Sig.term())
+    | let sig: HandleableSignal =>
       SignalHandler(auth, _NoOpNotify, sig where wait = false)
     | let _: ValidationFailure =>
       None
