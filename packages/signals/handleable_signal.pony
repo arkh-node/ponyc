@@ -38,9 +38,12 @@ primitive HandleableSignalValidator is Validator[U32]
   // builds the runtime reserves it as its scheduler sleep/wake signal and
   // `Sig.usr2()` is a compile error, so it can never reach the whitelist. On
   // scheduler_scaling_pthreads builds the scheduler uses condition variables
-  // instead, leaving SIGUSR2 free. runtime_tracing also uses SIGUSR2, but it
-  // consumes the signal on its own thread via sigwait rather than installing a
-  // handler, so a user handler still fires — it does not need excluding here.
+  // instead, leaving SIGUSR2 free. runtime_tracing also uses SIGUSR2
+  // (PONY_TRACING_SLEEP_WAKE_SIGNAL in src/libponyrt/tracing/tracing.c), but it
+  // blocks the signal only inside its own tracing thread, not in every runtime
+  // thread the way the scheduler does. A process-directed SIGUSR2 is delivered
+  // to a thread that has not blocked it, so a user handler still fires and
+  // runtime_tracing does not need excluding here.
   // This gate must match Sig.usr2()'s in sig.pony, and both mirror the
   // runtime's PONY_SCHED_SLEEP_WAKE_SIGNAL (src/libponyrt/sched/scheduler.h).
   // If the runtime's sleep/wake signal changes, or the build flag that frees
