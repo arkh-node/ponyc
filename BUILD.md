@@ -207,11 +207,24 @@ Note that you only need to run `cmake -P lib/build-libs.cmake` once the first ti
 
 ### Unsupported Windows build options
 
-Several `use=` build options aren't supported on Windows (MSVC). The supported ones are `systematic_testing`, `pool_retain`, `pooltrack`, `runtimestats`, `runtimestats_messages`, and `runtime_tracing`. The rest depend on POSIX interfaces or Clang/GCC toolchain features MSVC doesn't provide: `pool_memalign` needs `posix_memalign`, the sanitizers and `coverage` need the Clang/GCC `-fsanitize=`/`-fprofile-arcs` interfaces, and `scheduler_scaling_pthreads` needs pthreads. `cmake --preset windows-x86-64 -DPONY_USES=...` rejects the unsupported options with a clear error rather than failing partway through the build.
+Several `use=` build options aren't supported on Windows (MSVC). The supported ones are `systematic_testing`, `pool_retain`, `pooltrack`, `runtimestats`, `runtimestats_messages`, and `runtime_tracing`. The rest depend on POSIX interfaces or Clang/GCC toolchain features MSVC doesn't provide: `pool_memalign` needs `posix_memalign`, the sanitizers and `coverage` need the Clang/GCC `-fsanitize=`/`-fprofile-arcs` interfaces, and `scheduler_scaling_pthreads` needs pthreads. `pool_arena` is different: nothing about it is missing from Windows, but its Windows memory-reservation code hasn't been written yet, so it is rejected until that work lands. `cmake --preset windows-x86-64 -DPONY_USES=...` rejects the unsupported options with a clear error rather than failing partway through the build.
 
 ---
 
 ## Additional Build Options on Unix
+
+### pool_arena
+
+`use=pool_arena` builds the runtime with an experimental replacement for the pool allocator, designed in [discussion #5735](https://github.com/ponylang/ponyc/discussions/5735). It gets memory from the operating system in large owned arenas, reuses freed memory across size classes, and returns empty arenas to the operating system.
+
+```bash
+cmake --preset release -DPONY_USES=pool_arena
+cmake --build --preset release
+```
+
+The backend is incomplete while the discussion's build order lands: the scheduler's suspend-and-drain integration and Windows support are still to come. Memory freed for another thread is reclaimed when that thread next runs out of its current slab, so a thread that stops allocating — suspended or just idle — holds its freed memory until then. Its platform code follows the runtime's per-OS structure for the Unix platforms; Windows rejects it at configure time. Configuring it together with `address_sanitizer`, `valgrind`, or `pooltrack` is rejected: none of them can see this allocator's memory, and a clean run that checked nothing misleads. CI does not build it.
+
+Two sizing limits to know. A process gets 1,024 distinct allocator-using threads over its lifetime — slots are never reused, and the next thread aborts with a message; the runtime's own threads use a handful. And reserving an arena briefly maps twice the arena size (256 MiB) before trimming, so a process running near an address-space cap needs that much headroom at each arena boundary.
 
 ### arch
 

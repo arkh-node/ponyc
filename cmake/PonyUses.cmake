@@ -44,6 +44,7 @@ set(_pony_known_uses
     runtimestats
     runtimestats_messages
     pool_memalign
+    pool_arena
     pool_retain
     runtime_tracing)
 
@@ -79,11 +80,13 @@ list(REMOVE_DUPLICATES _pony_uses)
 
 foreach(_use IN LISTS _pony_uses)
     message(STATUS "Enabling use option: ${_use}")
-    # On Windows (MSVC) only the options in _pony_windows_uses build; the rest
-    # need POSIX or Clang/GCC toolchain features cl.exe doesn't provide, verified
-    # by building each on Windows: pool_memalign needs posix_memalign; the
-    # sanitizers and coverage need -fsanitize=/-fprofile-arcs;
-    # scheduler_scaling_pthreads needs pthreads.
+    # On Windows (MSVC) only the options in _pony_windows_uses build. Most of
+    # the rest need POSIX or Clang/GCC toolchain features cl.exe doesn't
+    # provide, verified by building each on Windows: pool_memalign needs
+    # posix_memalign; the sanitizers and coverage need
+    # -fsanitize=/-fprofile-arcs; scheduler_scaling_pthreads needs pthreads.
+    # pool_arena is rejected for a different reason: its Windows
+    # memory-reservation code is not written yet (see BUILD.md).
     # Reject the unsupported ones here rather than let the build fail partway
     # through with a confusing error. Keep BUILD.md's option list in step.
     if(MSVC AND NOT _use IN_LIST _pony_windows_uses)
@@ -149,6 +152,8 @@ foreach(_use IN LISTS _pony_uses)
         _pony_set_use(RUNTIMESTATS_MESSAGES ON)
     elseif(_use STREQUAL "pool_memalign")
         _pony_set_use(POOL_MEMALIGN ON)
+    elseif(_use STREQUAL "pool_arena")
+        _pony_set_use(POOL_ARENA ON)
     elseif(_use STREQUAL "pool_retain")
         _pony_set_use(POOL_RETAIN ON)
     elseif(_use STREQUAL "runtime_tracing")

@@ -6,8 +6,36 @@
 
 #include <platform.h>
 
+#if defined(USE_POOL_MEMALIGN) && defined(USE_POOL_ARENA)
+#  error "pool_memalign and pool_arena select different allocators; use one"
+#endif
+
+#if defined(USE_POOL_ARENA) && defined(USE_POOL_RETAIN)
+#  error "pool_retain modifies the default pool and does nothing under pool_arena"
+#endif
+
+/* The arena allocator's memory comes straight from mmap and carries no
+ * AddressSanitizer, Valgrind, or pooltrack instrumentation, so those
+ * builds would report clean runs while checking nothing of it. The
+ * allocator's own release-build checks are its memory-safety net; a
+ * quietly unprotected build is worse than a rejected one.
+ */
+#if defined(USE_POOL_ARENA) && defined(USE_ADDRESS_SANITIZER)
+#  error "address_sanitizer does not track pool_arena memory; use pool_memalign"
+#endif
+
+#if defined(USE_POOL_ARENA) && defined(USE_VALGRIND)
+#  error "valgrind has no annotations for pool_arena memory"
+#endif
+
+#if defined(USE_POOL_ARENA) && defined(USE_POOLTRACK)
+#  error "pooltrack instruments only the default pool"
+#endif
+
 #if defined(USE_POOL_MEMALIGN)
 #  define POOL_USE_MEMALIGN
+#elif defined(USE_POOL_ARENA)
+#  define POOL_USE_ARENA
 #else
 #  define POOL_USE_DEFAULT
 #endif
@@ -15,14 +43,19 @@
 PONY_EXTERN_C_BEGIN
 
 /* Because of the way free memory is reused as its own linked list container,
- * the minimum allocation size is 32 bytes for the default pool implementation
- * and 16 bytes for the memalign pool implementation.
+ * the minimum allocation size is 32 bytes for the default and arena pool
+ * implementations and 16 bytes for the memalign pool implementation.
+ *
+ * The interface guarantees a returned pointer is non-null, aligned (POOL_MIN
+ * always, POOL_ALIGN once the granted size reaches it), overlaps no live
+ * allocation, and keeps its content until freed. Whether a freed pointer
+ * comes back at the same address is backend behavior, not a guarantee.
  */
 
-#ifndef POOL_USE_DEFAULT
-#define POOL_MIN_BITS 4
-#else
+#if defined(POOL_USE_DEFAULT) || defined(POOL_USE_ARENA)
 #define POOL_MIN_BITS 5
+#else
+#define POOL_MIN_BITS 4
 #endif
 
 #define POOL_MAX_BITS 20
@@ -50,11 +83,11 @@ void ponyint_pool_thread_cleanup();
 
 size_t ponyint_pool_index(size_t size);
 
-size_t ponyint_pool_used_size(size_t index);
+size_t ponyint_pool_used_size(size_t size);
 
 size_t ponyint_pool_adjust_size(size_t size);
 
-#ifdef POOL_USE_DEFAULT
+#if defined(POOL_USE_DEFAULT) || defined(POOL_USE_ARENA)
 #define POOL_INDEX(SIZE) \
   __pony_choose_expr(SIZE <= (1 << (POOL_MIN_BITS + 0)), 0, \
   __pony_choose_expr(SIZE <= (1 << (POOL_MIN_BITS + 1)), 1, \

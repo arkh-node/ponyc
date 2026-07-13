@@ -38,6 +38,7 @@ set(_c_src
     mem/heap.c
     mem/pagemap.c
     mem/pool.c
+    mem/pool_arena.c
     mem/pool_memalign.c
     options/options.c
     platform/ponyassert.c
