@@ -19,7 +19,7 @@
 #define POOL_ALIGN_INDEX (POOL_ALIGN_BITS - POOL_MIN_BITS)
 #define POOL_ALIGN_MASK (POOL_ALIGN - 1)
 
-#ifdef POOL_USE_DEFAULT
+#ifdef POOL_USE_CLASSIC
 
 #ifdef USE_ADDRESS_SANITIZER
 #include <sanitizer/asan_interface.h>

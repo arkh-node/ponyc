@@ -162,9 +162,9 @@ if(PONY_USE_POOL_MEMALIGN)
     add_compile_options(-DUSE_POOL_MEMALIGN)
 endif()
 
-if(PONY_USE_POOL_ARENA)
-    set(PONY_OUTPUT_SUFFIX "${PONY_OUTPUT_SUFFIX}-pool_arena")
-    add_compile_options(-DUSE_POOL_ARENA)
+if(PONY_USE_POOL_CLASSIC)
+    set(PONY_OUTPUT_SUFFIX "${PONY_OUTPUT_SUFFIX}-pool_classic")
+    add_compile_options(-DUSE_POOL_CLASSIC)
 endif()
 
 if(PONY_USE_POOL_RETAIN)

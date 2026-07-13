@@ -16,7 +16,7 @@
 /* These tests assert the pool interface's contract — a returned pointer is
  * non-null, aligned, overlaps no live allocation, keeps its content until
  * freed, and freed memory is reused — rather than any backend's exact
- * addresses, so they run under the default, memalign, and arena backends.
+ * addresses, so they run under the classic, memalign, and arena backends.
  * Backend-specific behavior sits under that backend's ifdef. AddressSanitizer
  * cannot track the arena backend's allocations — it instruments the arena's
  * one mmap, not the objects carved from it — so the LiveTracker tests below
@@ -289,9 +289,9 @@ TEST(Pool, Index)
   index = ponyint_pool_index(16);
   ASSERT_TRUE(index == expected_index);
 
-#if !defined(POOL_USE_DEFAULT) && !defined(POOL_USE_ARENA)
+#if !defined(POOL_USE_CLASSIC) && !defined(POOL_USE_ARENA)
   // The memalign pool's minimum allocation is 16 bytes, so 17 falls in the
-  // second size class there; the default and arena pools start at 32.
+  // second size class there; the classic and arena pools start at 32.
   expected_index++;
 #endif
 
@@ -668,7 +668,7 @@ TEST(Pool, ReallocContract)
   ASSERT_EQ(t.count(), (size_t)0);
 }
 
-#if defined(POOL_USE_DEFAULT) || defined(POOL_USE_ARENA)
+#if defined(POOL_USE_CLASSIC) || defined(POOL_USE_ARENA)
 
 // Freed memory comes back: over many alloc/free cycles the set of distinct
 // addresses stays near the per-cycle working set instead of growing with
@@ -1218,7 +1218,7 @@ TEST(PoolArenaDeath, FreeIntoFreeUnit)
 
 // A block freed on another thread goes home through the owner's inbox and
 // its units are reused for the next block: the cross-thread stranding that
-// motivated the design, in miniature. On the current pool this exact churn
+// motivated the design, in miniature. On the classic pool this exact churn
 // reserves fresh address space per block and never reuses any.
 TEST(PoolArena, CrossThreadBlockChurn)
 {

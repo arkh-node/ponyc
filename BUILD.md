@@ -207,24 +207,28 @@ Note that you only need to run `cmake -P lib/build-libs.cmake` once the first ti
 
 ### Unsupported Windows build options
 
-Several `use=` build options aren't supported on Windows (MSVC). The supported ones are `systematic_testing`, `pool_retain`, `pooltrack`, `runtimestats`, `runtimestats_messages`, and `runtime_tracing`. The rest depend on POSIX interfaces or Clang/GCC toolchain features MSVC doesn't provide: `pool_memalign` needs `posix_memalign`, the sanitizers and `coverage` need the Clang/GCC `-fsanitize=`/`-fprofile-arcs` interfaces, and `scheduler_scaling_pthreads` needs pthreads. `pool_arena` is different: nothing about it is missing from Windows, but its Windows memory-reservation code hasn't been written yet, so it is rejected until that work lands. `cmake --preset windows-x86-64 -DPONY_USES=...` rejects the unsupported options with a clear error rather than failing partway through the build.
+Several `use=` build options aren't supported on Windows (MSVC). The supported ones are `systematic_testing`, `pool_classic`, `pool_retain`, `pooltrack`, `runtimestats`, `runtimestats_messages`, and `runtime_tracing`. The rest depend on POSIX interfaces or Clang/GCC toolchain features MSVC doesn't provide: `pool_memalign` needs `posix_memalign`, the sanitizers and `coverage` need the Clang/GCC `-fsanitize=`/`-fprofile-arcs` interfaces, and `scheduler_scaling_pthreads` needs pthreads. Windows also uses the classic pool as its default allocator — the arena allocator's Windows memory-reservation code hasn't been written yet — so `pool_classic` there is explicit selection of what the platform already gets. `cmake --preset windows-x86-64 -DPONY_USES=...` rejects the unsupported options with a clear error rather than failing partway through the build.
 
 ---
 
 ## Additional Build Options on Unix
 
-### pool_arena
+### the runtime allocator, and pool_classic
 
-`use=pool_arena` builds the runtime with an experimental replacement for the pool allocator, designed in [discussion #5735](https://github.com/ponylang/ponyc/discussions/5735). It gets memory from the operating system in large owned arenas, reuses freed memory across size classes, and returns empty arenas to the operating system.
+On Unix platforms the runtime's default allocator is the arena allocator designed in [discussion #5735](https://github.com/ponylang/ponyc/discussions/5735): it gets memory from the operating system in large owned arenas, reuses freed memory across threads and size classes, and returns empty arenas to the operating system. On Windows the default is the classic pool allocator, until the arena allocator's Windows memory-reservation code is written.
+
+`use=pool_classic` selects the classic pool on any platform:
 
 ```bash
-cmake --preset release -DPONY_USES=pool_arena
+cmake --preset release -DPONY_USES=pool_classic
 cmake --build --preset release
 ```
 
-The backend is incomplete while the discussion's build order lands: the scheduler's suspend-and-drain integration and Windows support are still to come. Memory freed for another thread is reclaimed when that thread next runs out of its current slab, so a thread that stops allocating — suspended or just idle — holds its freed memory until then. Its platform code follows the runtime's per-OS structure for the Unix platforms; Windows rejects it at configure time. Configuring it together with `address_sanitizer`, `valgrind`, or `pooltrack` is rejected: none of them can see this allocator's memory, and a clean run that checked nothing misleads. CI does not build it.
+Two pieces of the arena allocator's design are still to come: the scheduler's suspend-and-drain integration and the Windows support above. Until suspend-and-drain lands, memory freed for another thread is reclaimed when that thread next runs out of its current slab, so a thread that stops allocating — suspended or just idle — holds its freed memory until then.
 
-Two sizing limits to know. A process gets 1,024 distinct allocator-using threads over its lifetime — slots are never reused, and the next thread aborts with a message; the runtime's own threads use a handful. And reserving an arena briefly maps twice the arena size (256 MiB) before trimming, so a process running near an address-space cap needs that much headroom at each arena boundary.
+The arena allocator carries no AddressSanitizer, Valgrind, or pooltrack instrumentation, so combining it with `address_sanitizer`, `valgrind`, or `pooltrack` is rejected at compile time: a clean run that checked nothing misleads. Pair those options with `pool_classic` (or, for AddressSanitizer, `pool_memalign`).
+
+Two sizing limits to know about the arena allocator. A process gets 1,024 distinct allocator-using threads over its lifetime — slots are never reused, and the next thread aborts with a message; the runtime's own threads use a handful. And reserving an arena briefly maps twice the arena size (256 MiB) before trimming, so a process running near an address-space cap needs that much headroom at each arena boundary.
 
 ### arch
 
@@ -239,7 +243,7 @@ cmake --build --preset release
 
 ponyc can be built with the Clang/LLVM sanitizers to catch bugs in the compiler and the Pony runtime at runtime. Three `use=` options are available: `address_sanitizer` (AddressSanitizer — buffer overflows, use-after-free, double-free), `thread_sanitizer` (ThreadSanitizer — data races), and `undefined_behavior_sanitizer` (UndefinedBehaviorSanitizer — signed integer overflow, misaligned access, and other undefined behavior). AddressSanitizer and ThreadSanitizer can't be combined; either can be combined with UndefinedBehaviorSanitizer.
 
-Pair `address_sanitizer` with `pool_memalign` so AddressSanitizer can track the Pony runtime's own allocations: `pool_memalign` routes every runtime allocation through `posix_memalign`/`free`, which AddressSanitizer intercepts and surrounds with redzones. The combination CI builds and tests has a preset:
+Pair `address_sanitizer` with `pool_memalign` so AddressSanitizer can track the Pony runtime's own allocations: `pool_memalign` routes every runtime allocation through `posix_memalign`/`free`, which AddressSanitizer intercepts and surrounds with redzones. The pairing is required, not just recommended — the default arena allocator rejects `address_sanitizer` at compile time (see the runtime allocator section above). The combination CI builds and tests has a preset:
 
 ```bash
 cmake --preset debug-asan

@@ -60,7 +60,10 @@ jobs:
             directives: pool_memalign
           - image: ghcr.io/ponylang/ponyc-ci-ubuntu26.04-builder:20260425
             debugger: lldb
-            directives: pool_retain
+            directives: pool_classic
+          - image: ghcr.io/ponylang/ponyc-ci-ubuntu26.04-builder:20260425
+            debugger: lldb
+            directives: pool_classic,pool_retain
           - image: ghcr.io/ponylang/ponyc-ci-ubuntu26.04-builder:20260425
             debugger: lldb
             directives: runtimestats
@@ -148,6 +151,10 @@ jobs:
           # runtime_tracing's format specifiers for the runtimestats-gated fields
           # only compile in this combined build, so cover it explicitly.
           - directives: runtime_tracing,runtimestats
+          # pool_classic is Windows's default pool either way; the row keeps the
+          # explicit flag building there, as PonyUses.cmake requires for every
+          # entry in its Windows allowlist.
+          - directives: pool_classic
     name: 'use ${{ matrix.directives }} (Windows)'
     steps:
       - name: Checkout

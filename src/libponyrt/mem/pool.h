@@ -6,12 +6,25 @@
 
 #include <platform.h>
 
-#if defined(USE_POOL_MEMALIGN) && defined(USE_POOL_ARENA)
-#  error "pool_memalign and pool_arena select different allocators; use one"
+#if defined(USE_POOL_MEMALIGN) && defined(USE_POOL_CLASSIC)
+#  error "pool_memalign and pool_classic select different allocators; use one"
 #endif
 
-#if defined(USE_POOL_ARENA) && defined(USE_POOL_RETAIN)
-#  error "pool_retain modifies the default pool and does nothing under pool_arena"
+/* The arena allocator is the default on Unix platforms. Windows keeps the
+ * classic pool until the arena's Windows memory-reservation code exists.
+ */
+#if defined(USE_POOL_MEMALIGN)
+#  define POOL_USE_MEMALIGN
+#elif defined(USE_POOL_CLASSIC)
+#  define POOL_USE_CLASSIC
+#elif defined(PLATFORM_IS_WINDOWS)
+#  define POOL_USE_CLASSIC
+#else
+#  define POOL_USE_ARENA
+#endif
+
+#if defined(USE_POOL_RETAIN) && !defined(POOL_USE_CLASSIC)
+#  error "pool_retain modifies the classic pool; add pool_classic"
 #endif
 
 /* The arena allocator's memory comes straight from mmap and carries no
@@ -20,30 +33,22 @@
  * allocator's own release-build checks are its memory-safety net; a
  * quietly unprotected build is worse than a rejected one.
  */
-#if defined(USE_POOL_ARENA) && defined(USE_ADDRESS_SANITIZER)
-#  error "address_sanitizer does not track pool_arena memory; use pool_memalign"
+#if defined(POOL_USE_ARENA) && defined(USE_ADDRESS_SANITIZER)
+#  error "address_sanitizer cannot track the arena allocator; add pool_memalign or pool_classic"
 #endif
 
-#if defined(USE_POOL_ARENA) && defined(USE_VALGRIND)
-#  error "valgrind has no annotations for pool_arena memory"
+#if defined(POOL_USE_ARENA) && defined(USE_VALGRIND)
+#  error "valgrind has no annotations for the arena allocator; add pool_classic"
 #endif
 
-#if defined(USE_POOL_ARENA) && defined(USE_POOLTRACK)
-#  error "pooltrack instruments only the default pool"
-#endif
-
-#if defined(USE_POOL_MEMALIGN)
-#  define POOL_USE_MEMALIGN
-#elif defined(USE_POOL_ARENA)
-#  define POOL_USE_ARENA
-#else
-#  define POOL_USE_DEFAULT
+#if defined(POOL_USE_ARENA) && defined(USE_POOLTRACK)
+#  error "pooltrack instruments only the classic pool; add pool_classic"
 #endif
 
 PONY_EXTERN_C_BEGIN
 
 /* Because of the way free memory is reused as its own linked list container,
- * the minimum allocation size is 32 bytes for the default and arena pool
+ * the minimum allocation size is 32 bytes for the classic and arena pool
  * implementations and 16 bytes for the memalign pool implementation.
  *
  * The interface guarantees a returned pointer is non-null, aligned (POOL_MIN
@@ -52,7 +57,7 @@ PONY_EXTERN_C_BEGIN
  * comes back at the same address is backend behavior, not a guarantee.
  */
 
-#if defined(POOL_USE_DEFAULT) || defined(POOL_USE_ARENA)
+#if defined(POOL_USE_CLASSIC) || defined(POOL_USE_ARENA)
 #define POOL_MIN_BITS 5
 #else
 #define POOL_MIN_BITS 4
@@ -87,7 +92,7 @@ size_t ponyint_pool_used_size(size_t size);
 
 size_t ponyint_pool_adjust_size(size_t size);
 
-#if defined(POOL_USE_DEFAULT) || defined(POOL_USE_ARENA)
+#if defined(POOL_USE_CLASSIC) || defined(POOL_USE_ARENA)
 #define POOL_INDEX(SIZE) \
   __pony_choose_expr(SIZE <= (1 << (POOL_MIN_BITS + 0)), 0, \
   __pony_choose_expr(SIZE <= (1 << (POOL_MIN_BITS + 1)), 1, \
