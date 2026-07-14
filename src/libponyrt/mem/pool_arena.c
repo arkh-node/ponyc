@@ -14,33 +14,46 @@
 
 #ifdef POOL_USE_ARENA
 
-/* An allocator in which every region of memory has an owner, so that freed
+/* An allocator in which every piece of memory has an owner, so that freed
  * memory can be merged, reused across threads, and returned to the operating
  * system. The design is laid out in ponylang/ponyc discussion #5735.
  *
- * Memory comes from the operating system in arenas: single mappings whose
- * starting address is a multiple of their size, owned by the thread that
- * reserved them. An arena is divided into units; a slab is a run of units
- * all serving one size class. Masking a freed pointer's low bits yields its
- * arena, and the arena's header holds all bookkeeping: a free/used bit per
+ * Memory comes from the operating system in regions: single mappings
+ * aligned to their size, shared by every thread and never unmapped. A
+ * region is divided into arenas; a thread takes ownership of an arena by
+ * claiming a bit in the region's slot bitmap with one compare-and-swap,
+ * and gives one back by dropping its pages and clearing the bit. The
+ * region's first arena slot holds the region header and is never claimed.
+ * An empty region is nothing special: every other slot's pages are
+ * already dropped, and its address space stays parked on the region list
+ * for the next claim, so the allocator never races an unmap.
+ *
+ * An arena is divided into units; a slab is a run of units all serving
+ * one size class. Masking a freed pointer's low bits yields its arena,
+ * and the arena's header holds all bookkeeping: a free/used bit per
  * unit and a record per unit. Nothing sits in front of an object, and no
- * allocator metadata lives in freed object memory except the free-list link
- * in the object's first word.
+ * allocator metadata lives in freed object memory except the free-list
+ * link in the object's first word.
  *
  * A span of free units is a span of zero bits in the bitmap, so freeing
  * never needs to merge blocks: adjacent free spans are already one span.
  */
 
-/// Arena size. Must be a power of two; an arena is aligned to its size.
-/// The geometry here (arena size, unit size, sweep threshold) is mirrored
-/// by the PoolArena tests' TEST_* constants; change both together.
+/// Region and arena size. Powers of two; each is aligned to its size.
+/// The geometry here (region, arena, and unit size, sweep threshold) is
+/// mirrored by the PoolArena tests' TEST_* constants; change both
+/// together.
 #ifdef PLATFORM_IS_ILP32
-#  define ARENA_SIZE ((size_t)16 * 1024 * 1024)
+#  define REGION_SIZE ((size_t)64 * 1024 * 1024)
+#  define ARENA_SIZE ((size_t)2 * 1024 * 1024)
 #else
-#  define ARENA_SIZE ((size_t)128 * 1024 * 1024)
+#  define REGION_SIZE ((size_t)256 * 1024 * 1024)
+#  define ARENA_SIZE ((size_t)8 * 1024 * 1024)
 #endif
 
+#define REGION_MASK (REGION_SIZE - 1)
 #define ARENA_MASK (ARENA_SIZE - 1)
+#define REGION_ARENAS (REGION_SIZE / ARENA_SIZE)
 
 /// Unit size: the granularity of slabs and of returning memory.
 #define UNIT_BITS 14
@@ -62,6 +75,7 @@
 /// Mapping kinds, for the header a free finds by masking.
 #define MAPPING_ARENA 1
 #define MAPPING_OVERSIZED 2
+#define MAPPING_REGION 3
 
 /// Debug builds write this canary into the first word of each unit of a
 /// released slab and, when re-reserving a unit whose pages were never
@@ -216,10 +230,30 @@ struct pool_arena_thread_t;
 #define DECOMMIT_IMMEDIATE_SPAN 16
 
 /// Sweep an arena's dirty units once this many accumulate: a quarter of the
-/// arena (32 MiB on 64-bit). Below that, free units keep their pages as a
+/// arena (2 MiB on 64-bit). Below that, free units keep their pages as a
 /// reuse cache; dropping them eagerly makes a churning workload re-fault
 /// the pages back in, which costs more than the memory is worth.
 #define DIRTY_SWEEP_THRESHOLD (ARENA_UNITS / 4)
+
+/// The header at the start of every region, in space budgeted as arena
+/// slot 0: the slot's bit is set from birth, so no arena is ever carved
+/// over it. Immutable after publication except the slot bitmap.
+typedef struct region_t
+{
+  uint8_t kind;
+  /// One bit per arena slot; a set bit is a claimed slot. The region's
+  /// only occupancy state.
+  PONY_ATOMIC(uint32_t) slots;
+  /// The next region on the global list. Written before the region is
+  /// published and never changed: the list only grows, so walking it
+  /// never races an unmap.
+  struct region_t* next;
+} region_t;
+
+pony_static_assert(REGION_ARENAS == 32,
+  "a region's slot bitmap is one 32-bit word");
+
+static PONY_ATOMIC(region_t*) regions_head;
 
 /// The header at the start of every arena. Only the owner writes any of it.
 /// The first cache line holds only the fields every foreign free reads and
@@ -268,6 +302,9 @@ typedef struct pool_arena_thread_t
   uint32_t slot;
   /// This thread's own inbox, cached at slot assignment.
   inbox_t* inbox;
+  /// The region this thread last carved from, tried first on the next
+  /// carve.
+  region_t* current_region;
   /// Owned arenas.
   arena_t* arenas;
   /// The slab each size class is currently allocating from.
@@ -509,18 +546,130 @@ static void owner_slot_init()
   this_thread.slot = slot;
 }
 
-static arena_t* arena_new()
+static region_t* region_of(arena_t* arena)
 {
-  owner_slot_init();
+  return (region_t*)((uintptr_t)arena & ~(uintptr_t)REGION_MASK);
+}
 
-  arena_t* arena = (arena_t*)ponyint_virt_reserve_aligned(ARENA_SIZE);
+/// Tries to claim a free arena slot in the region. Returns the claimed
+/// arena's base, or NULL when the region is full. The claim's acquire
+/// pairs with the release in arena_release, so a released slot's
+/// decommit completes before the claimer writes to the range.
+static arena_t* region_carve(region_t* region)
+{
+  uint32_t slots = atomic_load_explicit(&region->slots,
+    memory_order_relaxed);
+
+  while(slots != UINT32_MAX)
+  {
+    uint32_t index = __pony_ctz(~slots);
+
+    if(atomic_compare_exchange_weak_explicit(&region->slots, &slots,
+      slots | ((uint32_t)1 << index), memory_order_acquire,
+      memory_order_relaxed))
+      return (arena_t*)((char*)region + ((size_t)index * ARENA_SIZE));
+
+    // The failed exchange reloaded the bitmap; try the new low bit.
+  }
+
+  return NULL;
+}
+
+/// Reserves and publishes a fresh region, its header slot and the
+/// caller's first arena already claimed so no racing carver can take
+/// them. Returns that arena, or NULL when the operating system refuses
+/// the reservation. A publication race costs nothing but an extra
+/// region on the list, which later carves fill.
+static arena_t* region_create()
+{
+  region_t* region = (region_t*)ponyint_virt_reserve_aligned(REGION_SIZE);
+
+  if(region == NULL)
+    return NULL;
+
+  ponyint_virt_commit(region, sizeof(region_t));
+  region->kind = MAPPING_REGION;
+  atomic_store_explicit(&region->slots, (uint32_t)0x3,
+    memory_order_relaxed);
+
+  region_t* head = atomic_load_explicit(&regions_head,
+    memory_order_relaxed);
+
+  do
+  {
+    region->next = head;
+  } while(!atomic_compare_exchange_weak_explicit(&regions_head, &head,
+    region, memory_order_release, memory_order_relaxed));
+
+  return (arena_t*)((char*)region + ARENA_SIZE);
+}
+
+static void arena_release(arena_t* arena);
+
+/// An arena slot for a new arena: the cached region first, then every
+/// listed region, then a fresh region. On reservation failure, gives
+/// back this thread's empty reserve arena — its slot becomes claimable
+/// — and walks the list once more before giving up.
+static arena_t* arena_claim()
+{
+  arena_t* arena = NULL;
+
+  if(this_thread.current_region != NULL)
+    arena = region_carve(this_thread.current_region);
+
+  for(int attempt = 0; (arena == NULL) && (attempt < 2); attempt++)
+  {
+    region_t* region = atomic_load_explicit(&regions_head,
+      memory_order_acquire);
+
+    for(; region != NULL; region = region->next)
+    {
+      ARENA_CHECK(region->kind == MAPPING_REGION);
+      arena = region_carve(region);
+
+      if(arena != NULL)
+        break;
+    }
+
+    if((arena == NULL) && (attempt == 0))
+    {
+      arena = region_create();
+
+      if(arena == NULL)
+      {
+        // The reservation failed. The retry walk needs a free slot, so
+        // give back this thread's empty reserve arena if it holds one.
+        arena_t* empty = this_thread.arenas;
+
+        while((empty != NULL) &&
+          (empty->used_units != arena_header_units()))
+          empty = empty->next;
+
+        if(empty == NULL)
+          break;
+
+        arena_release(empty);
+      }
+    }
+  }
 
   if(arena == NULL)
   {
     perror("out of memory: ");
-    fprintf(stderr, "(tried to reserve a " __zu " byte arena)\n", ARENA_SIZE);
+    fprintf(stderr, "(tried to reserve a " __zu " byte region)\n",
+      REGION_SIZE);
     abort();
   }
+
+  this_thread.current_region = region_of(arena);
+  return arena;
+}
+
+static arena_t* arena_new()
+{
+  owner_slot_init();
+
+  arena_t* arena = arena_claim();
 
   ponyint_virt_commit(arena, arena_header_units() << UNIT_BITS);
 
@@ -551,7 +700,19 @@ static void arena_release(arena_t* arena)
   if(arena->next != NULL)
     arena->next->prev = arena->prev;
 
-  ponyint_virt_free(arena, ARENA_SIZE);
+  region_t* region = region_of(arena);
+  ARENA_CHECK(region->kind == MAPPING_REGION);
+
+  size_t index = ((uintptr_t)arena - (uintptr_t)region) / ARENA_SIZE;
+  ARENA_CHECK(index > 0);
+
+  // The pages go back before the slot opens: a claimer's acquire pairs
+  // with this release, so nothing it writes can precede the decommit.
+  ponyint_virt_decommit(arena, ARENA_SIZE);
+
+  uint32_t old = atomic_fetch_and_explicit(&region->slots,
+    ~((uint32_t)1 << index), memory_order_release);
+  ARENA_CHECK((old & ((uint32_t)1 << index)) != 0);
 }
 
 /// Takes span units out of an owned arena and initializes the head record.

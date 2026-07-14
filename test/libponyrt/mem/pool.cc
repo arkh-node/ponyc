@@ -7,6 +7,11 @@
 #include <stdint.h>
 #include <string.h>
 
+#ifdef PLATFORM_IS_LINUX
+#include <fcntl.h>
+#include <unistd.h>
+#endif
+
 #include <atomic>
 #include <map>
 #include <set>
@@ -263,6 +268,56 @@ bool maps_covers(void* p)
 
   fclose(f);
   return covered;
+}
+
+// Bytes of the range holding physical pages (or swap), from
+// /proc/self/pagemap. Parked address space stays mapped forever, so
+// mapped-or-not cannot show a release anymore; pages-or-not can.
+size_t resident_bytes(void* p, size_t len)
+{
+  int fd = open("/proc/self/pagemap", O_RDONLY);
+
+  if(fd < 0)
+    return SIZE_MAX;
+
+  size_t page = (size_t)sysconf(_SC_PAGESIZE);
+  uintptr_t from = (uintptr_t)p / page;
+  size_t npages = (len + page - 1) / page;
+  size_t resident = 0;
+
+  static const size_t batch = 4096;
+  uint64_t entries[batch];
+
+  for(size_t done = 0; done < npages;)
+  {
+    size_t n = npages - done;
+
+    if(n > batch)
+      n = batch;
+
+    ssize_t got = pread(fd, entries, n * sizeof(uint64_t),
+      (off_t)((from + done) * sizeof(uint64_t)));
+
+    if(got <= 0)
+    {
+      close(fd);
+      return SIZE_MAX;
+    }
+
+    size_t read_entries = (size_t)got / sizeof(uint64_t);
+
+    for(size_t i = 0; i < read_entries; i++)
+    {
+      // Bit 63: present. Bit 62: swapped — still held, not returned.
+      if((entries[i] & ((uint64_t)3 << 62)) != 0)
+        resident += page;
+    }
+
+    done += read_entries;
+  }
+
+  close(fd);
+  return resident;
 }
 #endif
 
@@ -689,13 +744,13 @@ TEST(Pool, FreedMemoryIsReused)
   };
 
   // The block leg stays well inside one arena alongside the pin (an arena
-  // holds ~127 MiB usable on 64-bit, 15 MiB on ILP32).
+  // holds ~7.9 MiB usable on 64-bit, ~1.9 MiB on ILP32).
 #ifdef PLATFORM_IS_ILP32
   static const Leg legs[] =
-    {{32, 64}, {4096, 64}, {2 * 1024 * 1024, 3}};
+    {{32, 64}, {4096, 64}, {512 * 1024, 3}};
 #else
   static const Leg legs[] =
-    {{32, 64}, {4096, 64}, {4 * 1024 * 1024, 24}};
+    {{32, 64}, {4096, 64}, {2 * 1024 * 1024, 3}};
 #endif
 
   for(size_t l = 0; l < (sizeof(legs) / sizeof(legs[0])); l++)
@@ -862,14 +917,20 @@ TEST(Pool, LiveRecordChurn)
  * PR.
  */
 #ifdef PLATFORM_IS_ILP32
-#define TEST_ARENA_SIZE ((size_t)16 * 1024 * 1024)
+#define TEST_REGION_SIZE ((size_t)64 * 1024 * 1024)
+#define TEST_ARENA_SIZE ((size_t)2 * 1024 * 1024)
 #else
-#define TEST_ARENA_SIZE ((size_t)128 * 1024 * 1024)
+#define TEST_REGION_SIZE ((size_t)256 * 1024 * 1024)
+#define TEST_ARENA_SIZE ((size_t)8 * 1024 * 1024)
 #endif
 #define TEST_UNIT_SIZE ((size_t)16 * 1024)
 #define TEST_SWEEP_THRESHOLD ((TEST_ARENA_SIZE / TEST_UNIT_SIZE) / 4)
 #define TEST_SEGMENT_SLOTS 256
 #define TEST_CHAIN_MAP_INITIAL 128
+
+/// A block sized so exactly one fits per arena (its span is more than
+/// half the arena's units), on both geometries. One block, one arena.
+#define TEST_ARENA_FILLING_BLOCK (TEST_ARENA_SIZE - (4 * TEST_UNIT_SIZE))
 
 namespace
 {
@@ -1043,7 +1104,7 @@ TEST(PoolArena, ArenaGeometry)
     for(int i = 0; i < 8; i++)
       ASSERT_EQ((uint8_t)recarved[i][0], 0x7e) << "re-carved canary " << i;
 
-    // Arena 1 is a checkerboard: thousands of free units, no two in a
+    // Arena 1 is a checkerboard: hundreds of free units, no two in a
     // row. Arena 2 is full. A two-unit span must open a third arena.
     char* span2 = (char*)ponyint_pool_alloc_size(32 * 1024);
     ASSERT_NE(arena_base_of(span2), base1);
@@ -1089,10 +1150,10 @@ TEST(PoolArena, BlockPlacement)
     ponyint_pool_free_size(block, p2);
 
 #ifndef PLATFORM_IS_ILP32
-    // Two 64 MiB blocks cannot share a 128 MiB arena with the pin; the
-    // second one opens its own arena, and freeing it unmaps that arena
-    // without touching the first block's memory.
-    size_t big = 64 * 1024 * 1024;
+    // Two 4 MiB blocks cannot share an 8 MiB arena with the pin; the
+    // second one opens its own arena, and freeing it drops that arena's
+    // pages without touching the first block's memory.
+    size_t big = 4 * 1024 * 1024;
     char* b1 = (char*)ponyint_pool_alloc_size(big);
     ASSERT_EQ(arena_base_of(b1), arena_base_of(pin));
     char* b2 = (char*)ponyint_pool_alloc_size(big);
@@ -1332,8 +1393,8 @@ TEST(PoolArena, CrossThreadBlockChurn)
 
     std::set<void*> distinct;
 
-    // Each spawned thread takes an owner slot that is never given back;
-    // this loop spends 100 of the process's fixed budget.
+    // The spawned threads only free, so none of them takes an owner
+    // slot.
     for(int i = 0; i < 100; i++)
     {
       // The owner allocates; a second thread frees. The owner's next
@@ -1729,16 +1790,17 @@ TEST(PoolArena, CrossThreadOversizedFree)
   ponyint_pool_free_size(size, q);
 }
 
-// One empty arena stays in reserve with its pages dropped; a second empty
-// arena goes back to the operating system. The reserve is what hands the
-// same address straight back when churn crosses the arena boundary.
-// Address equality alone cannot show the policy — the kernel tends to
-// remap a just-unmapped range at the same place — so on Linux the test
-// also asks /proc/self/maps whether each arena stayed mapped.
+// One empty arena stays in reserve with only its payload pages dropped;
+// a second empty arena is released whole, its slot cleared and every
+// page — header included — given back, while its address space stays
+// parked in the region. Address equality alone cannot tell the two
+// apart — a released slot is re-carved at the same address — so on
+// Linux the test asks /proc/self/pagemap which pages each arena still
+// holds.
 TEST(PoolArena, EmptyArenaReserve)
 {
   on_fresh_thread([]{
-    static const size_t big = 64 * 1024 * 1024;
+    static const size_t big = TEST_ARENA_FILLING_BLOCK;
 
     // Two blocks that cannot share one arena, in two arenas; freeing both
     // empties both. b1's arena empties first, so it is the one kept; b2's
@@ -1747,13 +1809,29 @@ TEST(PoolArena, EmptyArenaReserve)
     char* b2 = (char*)ponyint_pool_alloc_size(big);
     ASSERT_NE(b1, (char*)NULL);
     ASSERT_NE(b2, (char*)NULL);
+    memset(b1, 0x11, 4096);
+    memset(b2, 0x22, 4096);
 
 #ifdef PLATFORM_IS_LINUX
+    void* arena1 = (void*)arena_base_of(b1);
+    void* arena2 = (void*)arena_base_of(b2);
+
+    // Touched pages are resident before the frees, so the zero counts
+    // below show a return, not a block that never held pages.
+    ASSERT_GT(resident_bytes(b1, big), (size_t)0);
+    ASSERT_GT(resident_bytes(b2, big), (size_t)0);
+
     ponyint_pool_free_size(big, b1);
-    ASSERT_TRUE(maps_covers(b1));  // kept in reserve, not unmapped
+    // Kept in reserve: the block's pages went back, the header's stayed.
+    ASSERT_EQ(resident_bytes(b1, big), (size_t)0);
+    ASSERT_GT(resident_bytes(arena1, TEST_UNIT_SIZE), (size_t)0);
+
     ponyint_pool_free_size(big, b2);
-    ASSERT_TRUE(maps_covers(b1));  // the reserve survives the second free
-    ASSERT_FALSE(maps_covers(b2)); // the second empty arena returned
+    // Released: every page went back, and the reserve survived.
+    ASSERT_EQ(resident_bytes(arena2, TEST_ARENA_SIZE), (size_t)0);
+    ASSERT_GT(resident_bytes(arena1, TEST_UNIT_SIZE), (size_t)0);
+    // The released arena's address space is parked, not unmapped.
+    ASSERT_TRUE(maps_covers(b2));
 #else
     ponyint_pool_free_size(big, b1);
     ponyint_pool_free_size(big, b2);
@@ -1764,6 +1842,247 @@ TEST(PoolArena, EmptyArenaReserve)
     b3[0] = 'k';
     b3[big - 1] = 'l';
     ponyint_pool_free_size(big, b3);
+  });
+}
+
+namespace
+{
+
+uintptr_t region_base_of(void* p)
+{
+  return (uintptr_t)p & ~(TEST_REGION_SIZE - 1);
+}
+
+} // namespace
+
+// Fills arenas with one-per-arena blocks until some region holds the
+// complete slot set {1..REGION_ARENAS-1} of the caller's blocks: a
+// region proven to have had every slot free, whether fresh from the
+// operating system or fully parked. Prior tests leave partially-free
+// regions, and those can never accumulate the complete set. Appends
+// every allocated block to blocks, records the proven region's blocks
+// by arena base in by_arena, and returns the region's base, or 0 if
+// the bound runs out.
+uintptr_t fill_whole_region(std::vector<char*>& blocks,
+  std::map<uintptr_t, char*>& by_arena)
+{
+  static const size_t big = TEST_ARENA_FILLING_BLOCK;
+  static const size_t usable = (TEST_REGION_SIZE / TEST_ARENA_SIZE) - 1;
+
+  std::map<uintptr_t, std::map<uintptr_t, char*>> per_region;
+
+  for(int i = 0; i < 2048; i++)
+  {
+    char* p = (char*)ponyint_pool_alloc_size(big);
+
+    if(p == NULL)
+      return 0;
+
+    blocks.push_back(p);
+
+    std::map<uintptr_t, char*>& mine = per_region[region_base_of(p)];
+    mine[arena_base_of(p)] = p;
+
+    if(mine.size() == usable)
+    {
+      uintptr_t region = region_base_of(p);
+
+      // The complete set is exactly slots 1..usable: the header's slot
+      // is never carved, and no arena strays outside its slot grid.
+      for(size_t s = 1; s <= usable; s++)
+      {
+        if(mine.find(region + (s * TEST_ARENA_SIZE)) == mine.end())
+          return 0;
+      }
+
+      by_arena = mine;
+      return region;
+    }
+  }
+
+  return 0;
+}
+
+// A region hands out one arena per slot minus the header's, and the
+// arena past the last slot comes from another region.
+TEST(PoolArena, CrossRegionCarve)
+{
+  on_fresh_thread([]{
+    static const size_t big = TEST_ARENA_FILLING_BLOCK;
+
+    std::vector<char*> blocks;
+    std::map<uintptr_t, char*> by_arena;
+    uintptr_t full = fill_whole_region(blocks, by_arena);
+    ASSERT_NE(full, (uintptr_t)0) << "no region filled within bound";
+
+    // The region is full: the next arena lives somewhere else.
+    char* over = (char*)ponyint_pool_alloc_size(big);
+    ASSERT_NE(region_base_of(over), full);
+
+    ponyint_pool_free_size(big, over);
+
+    for(char* p : blocks)
+      ponyint_pool_free_size(big, p);
+  });
+}
+
+// Concurrent carving: every claim is one compare-and-swap on a shared
+// region's slot bitmap, and no two threads may ever hold the same
+// arena. All blocks stay live until the distinctness check is done, so
+// a released slot legitimately reused by a racer cannot masquerade as
+// a double claim. Each thread stamps and verifies its blocks, so a
+// slot handed out twice also shows up as a torn stamp.
+TEST(PoolArena, RegionCarveRace)
+{
+  static const int threads = 8;
+  static const int per_thread = 8;
+  static const size_t big = TEST_ARENA_FILLING_BLOCK;
+
+  std::vector<std::thread> carvers(threads);
+  std::vector<std::vector<char*>> blocks(threads);
+  std::atomic<int> ready(0);
+  std::atomic<bool> go(false);
+  std::atomic<int> done(0);
+  std::atomic<bool> checked(false);
+
+  for(int t = 0; t < threads; t++)
+  {
+    carvers[t] = std::thread([&, t]{
+      ready.fetch_add(1);
+
+      while(!go.load())
+        std::this_thread::yield();
+
+      for(int i = 0; i < per_thread; i++)
+      {
+        char* p = (char*)ponyint_pool_alloc_size(big);
+        ASSERT_NE(p, (char*)NULL);
+        memset(p, 0x50 + t, 256);
+        blocks[t].push_back(p);
+      }
+
+      for(char* p : blocks[t])
+      {
+        ASSERT_EQ((uint8_t)p[0], (uint8_t)(0x50 + t));
+        ASSERT_EQ((uint8_t)p[255], (uint8_t)(0x50 + t));
+      }
+
+      done.fetch_add(1);
+
+      while(!checked.load())
+        std::this_thread::yield();
+
+      // Freed by their owner: the arenas empty and release locally.
+      for(char* p : blocks[t])
+        ponyint_pool_free_size(big, p);
+    });
+  }
+
+  while(ready.load() != threads)
+    std::this_thread::yield();
+
+  go.store(true);
+
+  while(done.load() != threads)
+    std::this_thread::yield();
+
+  // Every arena claimed exactly once across all threads.
+  std::set<uintptr_t> arenas;
+
+  for(int t = 0; t < threads; t++)
+  {
+    for(char* p : blocks[t])
+      arenas.insert(arena_base_of(p));
+  }
+
+  ASSERT_EQ(arenas.size(), (size_t)(threads * per_thread));
+
+  checked.store(true);
+
+  for(int t = 0; t < threads; t++)
+    carvers[t].join();
+}
+
+// An emptied region's address space parks on the region list: its pages
+// are gone — the parked span reports no resident memory — but the next
+// demand re-carves the same slots at the same addresses, with no new
+// mapping involved.
+TEST(PoolArena, ParkedRegionRecarve)
+{
+  on_fresh_thread([]{
+    static const size_t big = TEST_ARENA_FILLING_BLOCK;
+    static const size_t usable = (TEST_REGION_SIZE / TEST_ARENA_SIZE) - 1;
+
+    // The pin shares its arena with the first block — the block's span
+    // fits beside one slab — so that arena never empties. The second
+    // block's arena is the first to empty and becomes the thread's kept
+    // reserve; every arena emptied after it releases its slot with all
+    // pages dropped.
+    void* pin = ponyint_pool_alloc(0);
+
+    std::vector<char*> blocks;
+    std::map<uintptr_t, char*> by_arena;
+    uintptr_t full = fill_whole_region(blocks, by_arena);
+    ASSERT_NE(full, (uintptr_t)0) << "no region filled within bound";
+
+    uintptr_t pinned = arena_base_of(blocks[0]);
+    ASSERT_EQ(pinned, arena_base_of(pin));
+    uintptr_t kept = arena_base_of(blocks[1]);
+
+    for(char* p : blocks)
+      ponyint_pool_free_size(big, p);
+
+#ifdef PLATFORM_IS_LINUX
+    size_t parked_seen = 0;
+
+    for(size_t s = 1; s <= usable; s++)
+    {
+      uintptr_t arena = full + (s * TEST_ARENA_SIZE);
+
+      if(arena == pinned)
+        continue; // the pin holds this arena live
+      else if(arena == kept)
+        ASSERT_GT(resident_bytes((void*)arena, TEST_UNIT_SIZE),
+          (size_t)0); // still claimed; the header's pages stay
+      else
+      {
+        ASSERT_EQ(resident_bytes((void*)arena, TEST_ARENA_SIZE),
+          (size_t)0) << "slot " << s;
+
+        if(parked_seen++ == 0)
+          ASSERT_TRUE(maps_covers((void*)arena)); // parked, not unmapped
+      }
+    }
+
+    ASSERT_GT(parked_seen, (size_t)0);
+#endif
+
+    // Re-carving retraces the frees: owned space first — the kept
+    // reserve, then the span beside the pin — then the current region's
+    // parked slots, lowest first. Every block comes back at its old
+    // address.
+    std::vector<char*> expect;
+    expect.push_back(blocks[1]);
+    expect.push_back(blocks[0]);
+
+    for(size_t s = 1; s <= usable; s++)
+    {
+      uintptr_t arena = full + (s * TEST_ARENA_SIZE);
+
+      if((arena != pinned) && (arena != kept))
+        expect.push_back(by_arena[arena]);
+    }
+
+    for(size_t i = 0; i < expect.size(); i++)
+    {
+      char* p = (char*)ponyint_pool_alloc_size(big);
+      ASSERT_EQ(p, expect[i]) << "recarve " << i;
+    }
+
+    for(char* p : expect)
+      ponyint_pool_free_size(big, p);
+
+    ponyint_pool_free(0, pin);
   });
 }
 
