@@ -160,9 +160,17 @@ What to verify:
 The kqueue `EPIPE`-on-macOS handling already exists in `kevent_receipt_has_error`
 — unrelated to this change, but be aware of it.
 
-FreeBSD is being verified locally with a QEMU VM. macOS needs a real machine or
-CI (`pr.yml` runs macOS jobs, but only once the PR is marked ready — draft PRs
-skip it).
+**FreeBSD is verified.** All 26 process tests pass on FreeBSD 15.1 (clang
+19.1.7), stable across repeated runs — so the kqueue `EVFILT_PROC` exit
+detection works, including the #5764 grandchild and #5748 stdin-open cases.
+macOS runs the same `EVFILT_PROC` code, so this is strong evidence for macOS
+too; a real macOS run (or `pr.yml`'s macOS job, once the PR is marked ready —
+draft PRs skip it) is still worth doing to be sure.
+
+One portability fix came out of the FreeBSD run: the fd-leak test used
+`/bin/true`, which is Linux-only; it now uses `/usr/bin/true`, which exists on
+Linux, the BSDs, and macOS. If you add tests, prefer `/usr/bin/true` and check
+any hardcoded `/bin/...` path exists on your platform.
 
 ## Windows
 

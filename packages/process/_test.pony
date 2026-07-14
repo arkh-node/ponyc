@@ -1387,7 +1387,9 @@ actor \nodoc\ _FdLeakDriver
     let process_auth = StartProcessAuth(_h.env.root)
     let backpressure_auth = ApplyReleaseBackpressureAuth(_h.env.root)
     let file_auth = FileAuth(_h.env.root)
-    let path = FilePath(file_auth, "/bin/true")
+    // /usr/bin/true exists on Linux, the BSDs, and macOS; /bin/true is
+    // Linux-only.
+    let path = FilePath(file_auth, "/usr/bin/true")
     let args: Array[String] val = ["true"]
     let vars: Array[String] val = ["HOME=/"; "PATH=/bin"]
 
