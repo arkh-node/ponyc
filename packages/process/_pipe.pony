@@ -131,11 +131,15 @@ class _Pipe
   fun ref begin(owner: AsioEventNotify) =>
     """
     Prepare the pipe for read or write, and listening, after the far end has
-    been handed to the other process.
+    been handed to the other process. A none/placeholder pipe (no fds) creates
+    no event.
     """
-    ifdef posix then
-      let flags = if _outgoing then AsioEvent.write() else AsioEvent.read() end
-      event = @pony_asio_event_create(owner, near_fd, flags, 0, true)
+    if near_fd != -1 then
+      ifdef posix then
+        let flags =
+          if _outgoing then AsioEvent.write() else AsioEvent.read() end
+        event = @pony_asio_event_create(owner, near_fd, flags, 0, true)
+      end
     end
     close_far()
 
@@ -156,7 +160,7 @@ class _Pipe
       let len =
         @read(near_fd, read_buf.cpointer(offset),
           read_buf.size() - offset)
-      if len == -1 then // OS signals write error
+      if len == -1 then // OS signals read error
         (consume read_buf, len, @pony_os_errno())
       else
         (consume read_buf, len, 0)
@@ -274,5 +278,7 @@ class _Pipe
     close_near()
 
   fun ref dispose() =>
-    @pony_asio_event_destroy(event)
-    event = AsioEvent.none()
+    if event isnt AsioEvent.none() then
+      @pony_asio_event_destroy(event)
+      event = AsioEvent.none()
+    end

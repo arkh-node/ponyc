@@ -55,6 +55,14 @@ primitive AsioEvent
 
   fun signal(): U32 => 1 << 3
 
+  fun proc(): U32 =>
+    """
+    Subscribe for a process-exit event. Used on kqueue platforms, where the
+    event fires when the process whose pid is the event's fd exits. Must match
+    `ASIO_PROC` in the runtime's `asio.h`.
+    """
+    1 << 5
+
   fun read_write(): U32 => read() or write()
 
   fun oneshot(): U32 => 1 << 8

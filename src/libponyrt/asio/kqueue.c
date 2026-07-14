@@ -305,6 +305,16 @@ DECLARE_THREAD_FN(ponyint_asio_backend_dispatch)
             }
             break;
 
+          case EVFILT_PROC:
+            if(ev->flags & ASIO_PROC)
+            {
+              // The watched process exited. Deliver it as a read so the owner
+              // reaps, matching the shape of the Linux pidfd exit event.
+              ev->readable = true;
+              pony_asio_event_send(ev, ASIO_READ, 0);
+            }
+            break;
+
           default: {}
         }
       }
@@ -397,6 +407,16 @@ PONY_API void pony_asio_event_subscribe(asio_event_t* ev)
     i++;
   }
 
+  if(ev->flags & ASIO_PROC)
+  {
+    // Watch for the process whose pid is ev->fd to exit. One-shot: a process
+    // exits once. This is how the process package detects a child's exit on
+    // kqueue platforms, the counterpart to the pidfd read event on Linux.
+    EV_SET(&event[i], ev->fd, EVFILT_PROC,
+      EV_ADD | EV_RECEIPT | EV_ONESHOT, NOTE_EXIT, 0, ev);
+    i++;
+  }
+
   struct kevent results[4];
   int rc = kevent(b->kq, event, i, results, i, NULL);
 
@@ -478,6 +498,15 @@ PONY_API void pony_asio_event_unsubscribe(asio_event_t* ev)
   {
     EV_SET(&event[i], (uintptr_t)ev, EVFILT_TIMER,
       EV_DELETE | EV_RECEIPT, 0, 0, ev);
+    i++;
+  }
+
+  if(ev->flags & ASIO_PROC)
+  {
+    // A one-shot EVFILT_PROC is auto-removed once it fires; the EV_DELETE then
+    // returns ENOENT, which EV_RECEIPT captures and we ignore, same as the
+    // other delete paths here.
+    EV_SET(&event[i], ev->fd, EVFILT_PROC, EV_DELETE | EV_RECEIPT, 0, 0, ev);
     i++;
   }
 
