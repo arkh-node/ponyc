@@ -1105,6 +1105,13 @@ static void wake_suspended_tracing_thread()
 
 static void perhaps_suspend_tracing_thread()
 {
+  // This thread frees other threads' trace messages continuously;
+  // deliver the pending chains before sleeping so their owners can
+  // reclaim (waking them if they sleep). It registers no waker of its
+  // own: it rarely owns pool memory, and its own mail waits for this
+  // call's drain-and-mark.
+  ponyint_pool_suspend_flush();
+
   // if we're not terminating
   // and dynamic scheduler scaling is not disabled for shutdown
   if (
@@ -1160,7 +1167,13 @@ static void perhaps_suspend_tracing_thread()
         break;
       }
     }
+
+    // Awake again: unmark and reclaim anything delivered while asleep.
+    ponyint_pool_drain();
   } else {
+    // The suspension was refused: unmark before carrying on.
+    ponyint_pool_drain();
+
     // unable to get the lock to suspend so yield for a bit
 #if defined(PLATFORM_IS_WINDOWS)
     Sleep(0);

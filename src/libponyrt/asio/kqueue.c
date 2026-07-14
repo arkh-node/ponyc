@@ -117,6 +117,16 @@ void ponyint_asio_backend_final(asio_backend_t* b)
   write(b->wakeup[1], &c, 1);
 }
 
+/// The allocator's wake for this thread: a delivery landed in its
+/// inbox while it blocked in kevent. A zero byte on the wakeup pipe is
+/// the same self-wake the retry path uses; only a one terminates.
+static void asio_drain_poke(void* arg)
+{
+  asio_backend_t* b = (asio_backend_t*)arg;
+  char c = 0;
+  write(b->wakeup[1], &c, 1);
+}
+
 static void handle_queue(asio_backend_t* b)
 {
   asio_msg_t* msg;
@@ -227,6 +237,12 @@ DECLARE_THREAD_FN(ponyint_asio_backend_dispatch)
   asio_backend_t* b = arg;
   pony_assert(b != NULL);
 
+  // A delivery into this thread's allocator inbox while it blocks in
+  // kevent pokes the wakeup pipe. Retired below, before the backend is
+  // freed. The pipe holds the byte, so a poke sent before the wait
+  // still fires it.
+  ponyint_pool_set_waker(asio_drain_poke, b);
+
 #if !defined(USE_SCHEDULER_SCALING_PTHREADS)
   // Make sure we block signals related to scheduler sleeping/waking
   // so they queue up to avoid race conditions
@@ -242,7 +258,14 @@ DECLARE_THREAD_FN(ponyint_asio_backend_dispatch)
   {
     struct timespec* timeout = NULL;
 
+    // Deliver pending frees and mark asleep: the wait below can block
+    // indefinitely, and mail must not sit for its whole length.
+    ponyint_pool_suspend_flush();
+
     int count = kevent(b->kq, NULL, 0, fired, MAX_EVENTS, timeout);
+
+    // Whatever woke us, this thread is running again: unmark, reclaim.
+    ponyint_pool_drain();
 
     for(int i = 0; i < count; i++)
     {
@@ -255,6 +278,11 @@ DECLARE_THREAD_FN(ponyint_asio_backend_dispatch)
 
         if(terminate == 1)
         {
+          // Retire the waker before the pipe closes: the retire waits
+          // out a producer already inside the poke, and stops new
+          // ones, so no poke can write to a closed (or reused) fd.
+          ponyint_pool_set_waker(NULL, NULL);
+
           close(b->kq);
           close(b->wakeup[0]);
           close(b->wakeup[1]);

@@ -272,6 +272,77 @@ static void send_msg_all(uint32_t from, sched_msg_t msg, intptr_t arg)
     send_msg(from, i, msg, arg);
 }
 
+/// Why a scheduler-family thread is being woken. WORK accompanies a
+/// count raise the caller has already made; DRAIN touches nothing but
+/// the drain flag, so a suspended thread empties its allocator inbox
+/// and sleeps on; SHUTDOWN is the terminal fan-out.
+typedef enum
+{
+  SCHED_WAKE_WORK,
+  SCHED_WAKE_DRAIN,
+  SCHED_WAKE_SHUTDOWN
+} sched_wake_reason_t;
+
+#if defined(USE_SCHEDULER_SCALING_PTHREADS)
+/// This thread is inside the suspension critical section and holds
+/// sched_mut. A drain wake fired from inside it (scheduler 0 frees
+/// foreign memory in its own sleep loop) must signal without locking;
+/// holding the mutex is itself what closes the sleeper's
+/// check-to-wait window.
+static __pony_thread_local bool sched_mut_held;
+#endif
+
+/// Every wake of a scheduler-family thread goes through here: one home
+/// for signal delivery, the pthreads lost-signal protocol, and the
+/// systematic-testing arms.
+static void sched_wake(scheduler_t* sched, sched_wake_reason_t reason)
+{
+  if(reason == SCHED_WAKE_DRAIN)
+    atomic_store_explicit(&sched->drain_requested, true,
+      memory_order_seq_cst);
+
+  // Only send a signal if the thread id is not NULL (musl specifically
+  // crashes if it is even though posix says it should return `ESRCH`
+  // instead if an invalid thread id is passed). This is only a concern
+  // during startup until pthread_create updates the thread id.
+  if(!sched->tid)
+    return;
+
+#if defined(USE_SYSTEMATIC_TESTING)
+  // Only a WORK wake yields: a drain producer may be an untracked
+  // thread with no timeslice to give (the flag is drained at the next
+  // real wake), and the shutdown fan-out runs after the tracking state
+  // is torn down, so it keeps the raw signal.
+  if(reason == SCHED_WAKE_WORK)
+    SYSTEMATIC_TESTING_YIELD();
+  else if(reason == SCHED_WAKE_SHUTDOWN)
+    ponyint_thread_wake(sched->tid, sched->sleep_object);
+#elif defined(USE_SCHEDULER_SCALING_PTHREADS)
+  if((reason == SCHED_WAKE_DRAIN) && !sched_mut_held)
+  {
+    // A condvar signal with no waiter is lost, and an allocator
+    // producer cannot spin-resend the way the scheduler's own wake
+    // paths do; holding sched_mut across the signal closes the
+    // sleeper's check-to-wait window.
+    pthread_mutex_lock(&sched_mut);
+    ponyint_thread_wake(sched->tid, sched->sleep_object);
+    pthread_mutex_unlock(&sched_mut);
+  } else {
+    ponyint_thread_wake(sched->tid, sched->sleep_object);
+  }
+#else
+  ponyint_thread_wake(sched->tid, sched->sleep_object);
+#endif
+}
+
+/// The trampoline the allocator's delivery path enters with: the
+/// include direction runs sched -> mem, so the allocator holds this by
+/// pointer.
+static void sched_drain_waker(void* arg)
+{
+  sched_wake((scheduler_t*)arg, SCHED_WAKE_DRAIN);
+}
+
 static void signal_suspended_threads(uint32_t sched_count, int32_t curr_sched_id)
 {
   // start at get_active_scheduler_count_check to not send signals to threads
@@ -281,29 +352,13 @@ static void signal_suspended_threads(uint32_t sched_count, int32_t curr_sched_id
   for(uint32_t i = start_sched_index; i < sched_count; i++)
   {
     if((int32_t)i != curr_sched_id)
-    {
-#if defined(USE_SYSTEMATIC_TESTING)
-      SYSTEMATIC_TESTING_YIELD();
-#else
-      // only send signal if the thread id is not NULL (musl specifically
-      // crashes if it is even though posix says it should return `ESRCH`
-      // instead if an invalid thread id is passed)
-      // this is only a concern during startup until the thread is created
-      // and pthread_create updates the thread id
-      if(scheduler[i].tid)
-        ponyint_thread_wake(scheduler[i].tid, scheduler[i].sleep_object);
-#endif
-    }
+      sched_wake(&scheduler[i], SCHED_WAKE_WORK);
   }
 }
 
 static void signal_suspended_pinned_actor_thread()
 {
-#if defined(USE_SYSTEMATIC_TESTING)
-  SYSTEMATIC_TESTING_YIELD();
-#else
-  ponyint_thread_wake(pinned_actor_scheduler->tid, pinned_actor_scheduler->sleep_object);
-#endif
+  sched_wake(pinned_actor_scheduler, SCHED_WAKE_WORK);
 }
 
 static void wake_suspended_pinned_actor_thread()
@@ -773,6 +828,15 @@ static pony_actor_t* suspend_scheduler(scheduler_t* sched,
     if(atomic_load_explicit(&runtime_shutdown_initiated, memory_order_relaxed))
       break;
 
+    // A delivery landed in this thread's allocator inbox: empty it and
+    // reclaim, still suspended. The drain writes no scheduler state;
+    // activity stays decided solely by the loop's own predicate, which
+    // is re-read after every drain — a scale-up landing mid-drain is
+    // observed, never lost.
+    if(atomic_exchange_explicit(&sched->drain_requested, false,
+      memory_order_seq_cst))
+      ponyint_pool_drain_suspended();
+
     // if we're scheduler 0 with noisy actors check to make
     // sure inject queue is empty to avoid race condition
     // between thread 0 sleeping and the ASIO thread getting a
@@ -884,51 +948,76 @@ static pony_actor_t* perhaps_suspend_scheduler(
     && !get_temporarily_disable_scheduler_scaling()
     && (sched == &scheduler[current_active_scheduler_count - 1])
     && (!sched->terminate)
-    && (current_active_scheduler_count == get_active_scheduler_count_check())
-#if defined(USE_SCHEDULER_SCALING_PTHREADS)
-    // try to acquire mutex if using pthreads
-    && !pthread_mutex_trylock(&sched_mut)
-#else
-    // try and get the bool that controls modifying the active scheduler count
-    // variable if using signals
-    && (!atomic_load_explicit(&scheduler_count_changing, memory_order_relaxed)
-      && !atomic_exchange_explicit(&scheduler_count_changing, true,
-      memory_order_acquire))
-#endif
-    )
+    && (current_active_scheduler_count == get_active_scheduler_count_check()))
   {
-    pony_actor_t* actor = NULL;
+    // Deliver pending foreign frees, take back what others delivered
+    // here, and mark this thread asleep for wake-on-delivery — before
+    // any lock: the flush can fire other owners' wakers, and on the
+    // pthreads arm a waker takes sched_mut.
+    ponyint_pool_suspend_flush();
 
-    // can only sleep if we're scheduler > 0 or if we're scheduler 0 and
-    // there is at least one noisy actor registered.
-    // COUPLING: that scheduler 0 only suspends with a noisy actor is what keeps
-    // active_scheduler_count >= 1 (and so the systematic-testing round-robin
-    // divisor non-zero) when no ASIO event can be registered -- see the abort
-    // in pony_asio_event_create (asio/event.c).
-    if((sched->index > 0) || ((sched->index == 0) && sched->asio_noisy))
+    if (
+#if defined(USE_SCHEDULER_SCALING_PTHREADS)
+      // try to acquire mutex if using pthreads
+      !pthread_mutex_trylock(&sched_mut)
+#else
+      // try and get the bool that controls modifying the active scheduler
+      // count variable if using signals
+      (!atomic_load_explicit(&scheduler_count_changing, memory_order_relaxed)
+        && !atomic_exchange_explicit(&scheduler_count_changing, true,
+        memory_order_acquire))
+#endif
+      )
     {
-      actor = suspend_scheduler(sched, current_active_scheduler_count);
-      // reset steal_attempts so we try to steal from all other schedulers
-      // prior to suspending again
-      *steal_attempts = 0;
+      pony_actor_t* actor = NULL;
+
+#if defined(USE_SCHEDULER_SCALING_PTHREADS)
+      sched_mut_held = true;
+#endif
+
+      // can only sleep if we're scheduler > 0 or if we're scheduler 0 and
+      // there is at least one noisy actor registered.
+      // COUPLING: that scheduler 0 only suspends with a noisy actor is what
+      // keeps active_scheduler_count >= 1 (and so the systematic-testing
+      // round-robin divisor non-zero) when no ASIO event can be registered
+      // -- see the abort in pony_asio_event_create (asio/event.c).
+      if((sched->index > 0) || ((sched->index == 0) && sched->asio_noisy))
+      {
+        actor = suspend_scheduler(sched, current_active_scheduler_count);
+        // reset steal_attempts so we try to steal from all other schedulers
+        // prior to suspending again
+        *steal_attempts = 0;
+      }
+      else
+      {
+        pony_assert(sched->index == 0);
+        pony_assert(!sched->asio_noisy);
+#if !defined(USE_SCHEDULER_SCALING_PTHREADS)
+        // suspend_scheduler() would have unlocked for us,
+        // but we didn't call it, so unlock now.
+        atomic_store_explicit(&scheduler_count_changing, false,
+          memory_order_release);
+#endif
+      }
+#if defined(USE_SCHEDULER_SCALING_PTHREADS)
+      sched_mut_held = false;
+      // unlock mutex if using pthreads
+      pthread_mutex_unlock(&sched_mut);
+#endif
+
+      // This thread is running again — whether suspension ended, was
+      // refused inside suspend_scheduler, or the inner gate said no.
+      // Unmark and reclaim anything delivered in the window.
+      ponyint_pool_drain();
+
+      if(actor != NULL)
+        return actor;
     }
     else
     {
-      pony_assert(sched->index == 0);
-      pony_assert(!sched->asio_noisy);
-#if !defined(USE_SCHEDULER_SCALING_PTHREADS)
-      // suspend_scheduler() would have unlocked for us,
-      // but we didn't call it, so unlock now.
-      atomic_store_explicit(&scheduler_count_changing, false,
-        memory_order_release);
-#endif
+      // The lock attempt failed: no suspension. Unmark.
+      ponyint_pool_drain();
     }
-#if defined(USE_SCHEDULER_SCALING_PTHREADS)
-    // unlock mutex if using pthreads
-    pthread_mutex_unlock(&sched_mut);
-#endif
-    if(actor != NULL)
-      return actor;
   }
   return NULL;
 }
@@ -1338,6 +1427,11 @@ static DECLARE_THREAD_FN(run_thread)
   ponyint_cpu_affinity(sched->cpu);
   TRACING_THREAD_START(this_scheduler);
 
+  // A delivery into this thread's allocator inbox while it is
+  // suspended wakes it to drain. Retired by ponyint_pool_thread_cleanup
+  // at thread exit, before the join that precedes any teardown.
+  ponyint_pool_set_waker(sched_drain_waker, sched);
+
 #if !defined(PLATFORM_IS_WINDOWS) && !defined(USE_SCHEDULER_SCALING_PTHREADS)
   // Make sure we block signals related to scheduler sleeping/waking
   // so they queue up to avoid race conditions
@@ -1359,6 +1453,10 @@ static DECLARE_THREAD_FN(run_thread)
 static void perhaps_suspend_pinned_actor_scheduler(
   scheduler_t* sched, uint64_t tsc, uint64_t tsc2)
 {
+  // Deliver pending foreign frees and mark asleep before any lock, as
+  // perhaps_suspend_scheduler does.
+  ponyint_pool_suspend_flush();
+
   // if we're not terminating
   // and dynamic scheduler scaling is not disabled for shutdown
   if ((!sched->terminate)
@@ -1375,6 +1473,32 @@ static void perhaps_suspend_pinned_actor_scheduler(
 #endif
     )
   {
+#if defined(USE_SCHEDULER_SCALING_PTHREADS)
+    sched_mut_held = true;
+#endif
+
+    // This sleep has no re-check loop: a drain wake landing between
+    // the flush above and the wait below would be lost on the pthreads
+    // arm (a signal with no waiter). Checked here, after the lock and
+    // BEFORE the suspended flag pair, so an abort leaves the pair
+    // untouched — a stale pair makes global unmute skip this thread
+    // and its wakers spin. The producer's set-flag-then-lock-then-
+    // signal is serialized by the lock against this whole window.
+    if(atomic_exchange_explicit(&sched->drain_requested, false,
+      memory_order_seq_cst))
+    {
+#if defined(USE_SCHEDULER_SCALING_PTHREADS)
+      sched_mut_held = false;
+      pthread_mutex_unlock(&sched_mut);
+#else
+      atomic_store_explicit(&scheduler_count_changing, false,
+        memory_order_release);
+#endif
+      // Not suspending this time; the outer loop's latch retries.
+      ponyint_pool_drain();
+      return;
+    }
+
     atomic_store_explicit(&pinned_actor_scheduler_suspended, true, memory_order_relaxed);
     atomic_store_explicit(&pinned_actor_scheduler_suspended_check, true, memory_order_relaxed);
 
@@ -1436,10 +1560,17 @@ static void perhaps_suspend_pinned_actor_scheduler(
 #endif
 
 #if defined(USE_SCHEDULER_SCALING_PTHREADS)
+    sched_mut_held = false;
     // unlock mutex if using pthreads
     pthread_mutex_unlock(&sched_mut);
 #endif
+
+    // Every wake of this single sleep is a suspension exit: unmark and
+    // reclaim anything delivered while asleep.
+    ponyint_pool_drain();
   } else {
+    // The suspension was refused: unmark before carrying on.
+    ponyint_pool_drain();
   // unable to get the lock to suspend so sleep for a bit
 #if defined(USE_SYSTEMATIC_TESTING)
     (void)tsc;
@@ -1462,6 +1593,12 @@ static void run_pinned_actors()
   pony_assert(PONY_PINNED_ACTOR_THREAD_INDEX == this_scheduler->index);
 
   scheduler_t* sched = this_scheduler;
+
+  // Retired by this thread's ponyint_pool_thread_cleanup after
+  // shutdown; the pinned scheduler_t and its sleep object outlive the
+  // scheduler array teardown, so a straggler producer in that window
+  // touches only live state.
+  ponyint_pool_set_waker(sched_drain_waker, sched);
 
 #if defined(USE_SYSTEMATIC_TESTING)
   // start processing
@@ -1619,10 +1756,7 @@ static void ponyint_sched_shutdown()
   atomic_store_explicit(&active_scheduler_count, scheduler_count,
     memory_order_relaxed);
   for(uint32_t i = 0; i < scheduler_count; i++)
-  {
-    if(scheduler[i].tid)
-      ponyint_thread_wake(scheduler[i].tid, scheduler[i].sleep_object);
-  }
+    sched_wake(&scheduler[i], SCHED_WAKE_SHUTDOWN);
 
   while(start < scheduler_count)
   {

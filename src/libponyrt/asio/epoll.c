@@ -34,6 +34,15 @@ struct asio_backend_t
   messageq_t q;
 };
 
+/// The allocator's wake for this thread: a delivery landed in its
+/// inbox while it blocked in epoll_wait. The eventfd poke is the same
+/// self-wake the request path uses.
+static void asio_drain_poke(void* arg)
+{
+  asio_backend_t* b = (asio_backend_t*)arg;
+  eventfd_write(b->wakeup, 1);
+}
+
 static void send_request(asio_event_t* ev, int req)
 {
   asio_backend_t* b = ponyint_asio_get_backend();
@@ -226,6 +235,12 @@ DECLARE_THREAD_FN(ponyint_asio_backend_dispatch)
   asio_backend_t* b = arg;
   pony_assert(b != NULL);
 
+  // A delivery into this thread's allocator inbox while it blocks in
+  // epoll_wait pokes the wakeup eventfd; the poke is edge-triggered
+  // and never read, so pokes sent before the wait still fire it.
+  // Retired below, before the eventfd closes and the backend is freed.
+  ponyint_pool_set_waker(asio_drain_poke, b);
+
 #if !defined(USE_SCHEDULER_SCALING_PTHREADS)
   // Make sure we block signals related to scheduler sleeping/waking
   // so they queue up to avoid race conditions
@@ -239,7 +254,15 @@ DECLARE_THREAD_FN(ponyint_asio_backend_dispatch)
   {
     int wait_time = -1;
 
+    // Deliver pending frees and mark asleep: the wait below can block
+    // indefinitely, and mail must not sit for its whole length.
+    ponyint_pool_suspend_flush();
+
     int event_cnt = epoll_wait(b->epfd, b->events, MAX_EVENTS, wait_time);
+
+    // Whatever woke us — a poke for mail, or real events — this thread
+    // is running again: unmark and reclaim.
+    ponyint_pool_drain();
 
     for(int i = 0; i < event_cnt; i++)
     {
@@ -322,6 +345,10 @@ DECLARE_THREAD_FN(ponyint_asio_backend_dispatch)
 
     handle_queue(b);
   }
+
+  // Retire the waker before anything it references is closed or
+  // freed; the retire waits out a producer already inside the poke.
+  ponyint_pool_set_waker(NULL, NULL);
 
   close(b->epfd);
   close(b->wakeup);

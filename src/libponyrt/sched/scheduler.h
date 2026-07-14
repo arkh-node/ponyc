@@ -110,6 +110,9 @@ struct scheduler_t
   bool asio_stoppable;
   int32_t asio_noisy;
   pony_signal_event_t sleep_object;
+  /// A delivery landed in this thread's allocator inbox while it was
+  /// suspended: drain it inside the sleep loop, without waking for work.
+  PONY_ATOMIC(bool) drain_requested;
 
   // These are changed primarily by the owning scheduler thread.
   alignas(64) struct scheduler_t* last_victim;
