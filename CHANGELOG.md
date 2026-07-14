@@ -8,12 +8,17 @@ All notable changes to the Pony compiler and standard library will be documented
 
 - Fix Windows programs never finishing when stdin has ended ([PR #5740](https://github.com/ponylang/ponyc/pull/5740))
 - Fix Windows programs stalling while reading stdin from a pipe ([PR #5747](https://github.com/ponylang/ponyc/pull/5747))
+- Report a process's exit even when its pipes stay open ([PR #5770](https://github.com/ponylang/ponyc/pull/5770))
+- ProcessMonitor.dispose no longer risks signaling an unrelated process ([PR #5770](https://github.com/ponylang/ponyc/pull/5770))
+- ProcessMonitor no longer leaks file descriptors when a process fails to start ([PR #5770](https://github.com/ponylang/ponyc/pull/5770))
 
 ### Added
 
 
 ### Changed
 
+- Starting a process returns a result ([PR #5770](https://github.com/ponylang/ponyc/pull/5770))
+- ProcessMonitor requires Linux 5.3 or newer ([PR #5770](https://github.com/ponylang/ponyc/pull/5770))
 
 ## [0.67.0] - 2026-07-11
 
