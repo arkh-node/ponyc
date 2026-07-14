@@ -1057,6 +1057,27 @@ void ponyint_pool_thread_cleanup()
   pool_block_header.largest_size = 0;
 }
 
+/* The suspend-and-drain interface is arena-only: this backend has no
+ * inboxes, so these are no-ops.
+ */
+void ponyint_pool_suspend_flush()
+{
+}
+
+void ponyint_pool_drain()
+{
+}
+
+void ponyint_pool_drain_suspended()
+{
+}
+
+void ponyint_pool_set_waker(void (*wake)(void*), void* arg)
+{
+  (void)wake;
+  (void)arg;
+}
+
 #endif
 
 size_t ponyint_pool_index(size_t size)

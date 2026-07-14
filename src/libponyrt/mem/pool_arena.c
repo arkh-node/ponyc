@@ -3,6 +3,7 @@
 #include "pool.h"
 #include "alloc.h"
 #include "ponyassert.h"
+#include "../sched/cpu.h"
 #include <stdint.h>
 #include <stdbool.h>
 #include <stdlib.h>
@@ -132,10 +133,32 @@ typedef struct run_header_t
   uint16_t len;
 } run_header_t;
 
+/// The callback a delivery uses to wake a sleeping owner.
+typedef void (*pool_waker_fn)(void*);
+
+/* A thread that sleeps for long stretches marks itself asleep in its
+ * inbox; a delivery that turns the inbox from empty to non-empty while
+ * the mark is set calls the registered waker, once per refill. The
+ * sleep race is closed in the seq_cst total order: the owner stores
+ * the mark and then re-checks the head; a producer pushes and then
+ * loads the mark; one of the two must see the other. Teardown clears
+ * the mark, waits until no producer is inside the waker (the pin), and
+ * only then retires it, so a waker is never called into freed state.
+ */
 typedef struct inbox_t
 {
   alignas(64) PONY_ATOMIC(run_header_t*) head;
+  /// The owner is asleep: a delivery that fills the empty inbox calls
+  /// the waker.
+  PONY_ATOMIC(uint32_t) sleeping;
+  /// Producers inside (or entering) the waker; teardown waits for zero.
+  PONY_ATOMIC(uint32_t) pins;
+  PONY_ATOMIC(pool_waker_fn) waker;
+  PONY_ATOMIC(void*) waker_arg;
 } inbox_t;
+
+pony_static_assert(sizeof(inbox_t) <= 64,
+  "an inbox and its wake state share one cache line");
 
 typedef struct chain_t
 {
@@ -299,6 +322,10 @@ typedef struct pool_arena_thread_t
   uint32_t slot;
   /// This thread's own inbox, cached at slot assignment.
   inbox_t* inbox;
+  /// The waker registered before the slot exists, applied at slot
+  /// assignment (slots are lazy).
+  pool_waker_fn waker;
+  void* waker_arg;
   /// The region this thread last carved from, tried first on the next
   /// carve.
   region_t* current_region;
@@ -541,6 +568,17 @@ static void owner_slot_init()
 
   this_thread.inbox = inbox_for_slot(slot);
   this_thread.slot = slot;
+
+  // A waker registered before the slot existed applies now. Plain-order
+  // stores: no producer reads them until this thread first declares
+  // itself asleep, and that seq_cst store orders these before it.
+  if(this_thread.waker != NULL)
+  {
+    atomic_store_explicit(&this_thread.inbox->waker, this_thread.waker,
+      memory_order_relaxed);
+    atomic_store_explicit(&this_thread.inbox->waker_arg,
+      this_thread.waker_arg, memory_order_relaxed);
+  }
 }
 
 static region_t* region_of(arena_t* arena)
@@ -1115,7 +1153,36 @@ static void chain_flush(chain_t* c)
   {
     list_tail->next_run = old;
   } while(!atomic_compare_exchange_weak_explicit(head, &old, run_list,
-    memory_order_release, memory_order_relaxed));
+    memory_order_seq_cst, memory_order_relaxed));
+
+  // A push that turned the inbox non-empty wakes a sleeping owner. The
+  // push and the sleeping load sit in the seq_cst total order against
+  // the owner's mark-then-recheck, so one side always sees the other.
+  // The pin keeps a teardown from retiring the waker under a producer
+  // that already saw the mark: teardown clears sleeping first, so the
+  // re-load after the pin turns late producers away.
+  if(old == NULL)
+  {
+    inbox_t* inbox = c->inbox;
+
+    if(atomic_load_explicit(&inbox->sleeping, memory_order_seq_cst) != 0)
+    {
+      atomic_fetch_add_explicit(&inbox->pins, 1, memory_order_seq_cst);
+
+      if(atomic_load_explicit(&inbox->sleeping, memory_order_seq_cst)
+        != 0)
+      {
+        pool_waker_fn fn = atomic_load_explicit(&inbox->waker,
+          memory_order_relaxed);
+
+        if(fn != NULL)
+          fn(atomic_load_explicit(&inbox->waker_arg,
+            memory_order_relaxed));
+      }
+
+      atomic_fetch_sub_explicit(&inbox->pins, 1, memory_order_seq_cst);
+    }
+  }
 }
 
 /// Credits one run of foreign-freed objects to its slab, after checking
@@ -1476,22 +1543,130 @@ void* ponyint_pool_realloc_size(size_t old_size, size_t new_size, void* p)
   return new_p;
 }
 
-void ponyint_pool_thread_cleanup()
+/// Delivers every pending foreign chain without dropping the map.
+static void chains_flush_all()
 {
   chain_t* map = this_thread.chains;
 
   if(map == NULL)
     return;
 
-  // Deliver every pending foreign free to its owner, then drop the map.
-  // Nothing else happens at thread exit: the allocator leaves its own
-  // memory in place, because threads exit in no fixed order and
-  // unmapping could hit memory another thread still uses.
   for(uint32_t i = 0; i < this_thread.chain_cap; i++)
   {
     if(map[i].inbox != NULL)
       chain_flush(&map[i]);
   }
+}
+
+/// Test seam: called between suspend_flush's drain and its mark, so a
+/// test can place a delivery exactly in the window the re-check
+/// guards. NULL outside tests; the flush is a cold path.
+static void (*suspend_flush_window_hook)(void);
+
+void ponyint_pool_arena_suspend_flush_hook_for_test(void (*fn)(void))
+{
+  suspend_flush_window_hook = fn;
+}
+
+void ponyint_pool_suspend_flush()
+{
+  chains_flush_all();
+
+  if(this_thread.slot == NO_OWNER_SLOT)
+    return;
+
+  inbox_t* inbox = this_thread.inbox;
+
+  // Mark asleep, then re-check for a delivery that raced the mark; the
+  // seq_cst order guarantees a producer that missed the mark is seen
+  // here, and one that saw it wakes us.
+  while(true)
+  {
+    inbox_drain();
+
+    if(suspend_flush_window_hook != NULL)
+      suspend_flush_window_hook();
+
+    atomic_store_explicit(&inbox->sleeping, 1, memory_order_seq_cst);
+
+    if(atomic_load_explicit(&inbox->head, memory_order_seq_cst) == NULL)
+      return;
+
+    atomic_store_explicit(&inbox->sleeping, 0, memory_order_seq_cst);
+  }
+}
+
+void ponyint_pool_drain()
+{
+  if(this_thread.slot == NO_OWNER_SLOT)
+    return;
+
+  // The clear precedes the drain so a delivery landing between the two
+  // costs at most one spurious wake, never a lost one.
+  atomic_store_explicit(&this_thread.inbox->sleeping, 0,
+    memory_order_seq_cst);
+  inbox_drain();
+}
+
+void ponyint_pool_drain_suspended()
+{
+  if(this_thread.slot == NO_OWNER_SLOT)
+    return;
+
+  // The mark stays: the caller is still suspended, and the next refill
+  // must wake it again.
+  inbox_drain();
+}
+
+void ponyint_pool_set_waker(void (*wake)(void*), void* arg)
+{
+  this_thread.waker = wake;
+  this_thread.waker_arg = arg;
+
+  if(this_thread.slot == NO_OWNER_SLOT)
+    return;
+
+  inbox_t* inbox = this_thread.inbox;
+
+  if(wake == NULL)
+  {
+    // Retire: stop new producers at the mark, wait out any already
+    // past it, then drop the callback. After this returns, nothing can
+    // call into whatever the callback referenced.
+    atomic_store_explicit(&inbox->sleeping, 0, memory_order_seq_cst);
+
+    while(atomic_load_explicit(&inbox->pins, memory_order_seq_cst) != 0)
+      ponyint_cpu_relax();
+
+    atomic_store_explicit(&inbox->waker, NULL, memory_order_relaxed);
+    atomic_store_explicit(&inbox->waker_arg, NULL, memory_order_relaxed);
+    return;
+  }
+
+  atomic_store_explicit(&inbox->waker, wake, memory_order_relaxed);
+  atomic_store_explicit(&inbox->waker_arg, arg, memory_order_relaxed);
+}
+
+void ponyint_pool_thread_cleanup()
+{
+  // Deliver every pending foreign free to its owner, take back what
+  // others delivered here (crediting one's own inbox touches only this
+  // thread's arenas), and retire the wake state so no late producer
+  // calls into a thread that is gone. The allocator's own memory stays
+  // in place: threads exit in no fixed order, and unmapping could hit
+  // memory another thread still uses.
+  chains_flush_all();
+
+  if(this_thread.slot != NO_OWNER_SLOT)
+  {
+    ponyint_pool_set_waker(NULL, NULL);
+    inbox_drain();
+  }
+
+  chain_t* map = this_thread.chains;
+
+  if(map == NULL)
+    return;
 
   ponyint_virt_free(map, this_thread.chain_cap * sizeof(chain_t));
   this_thread.chains = NULL;
@@ -1510,6 +1685,17 @@ uint32_t ponyint_pool_arena_owner_slots_for_test()
 void ponyint_pool_arena_credit_run_for_test(void* run_tail)
 {
   apply_run((run_header_t*)run_tail);
+}
+
+/// Test seam: whether the caller's inbox is empty. The suspend-drain
+/// tests use it to tell mail consumed by a flush from mail stranded.
+bool ponyint_pool_arena_inbox_empty_for_test()
+{
+  if(this_thread.slot == NO_OWNER_SLOT)
+    return true;
+
+  return atomic_load_explicit(&this_thread.inbox->head,
+    memory_order_seq_cst) == NULL;
 }
 
 #endif

@@ -1799,6 +1799,270 @@ TEST(PoolArena, FreeOnlyThreadTakesNoSlot)
   ASSERT_EQ(ponyint_pool_arena_owner_slots_for_test(), before + 1);
 }
 
+// The suspend-and-drain protocol, owner side and producer side. The
+// owner marks itself asleep with suspend_flush; a delivery that turns
+// its inbox non-empty calls the waker the owner registered, once per
+// refill. The producer-side waker runs on the freeing thread, so the
+// test waker just counts.
+TEST(PoolArena, SuspendFlushWakes)
+{
+  static std::atomic<int> wakes(0);
+  static std::atomic<void*> woken_arg(NULL);
+  int cookie = 0;
+
+  std::atomic<int> stage(0);
+  std::atomic<bool> done(false);
+  char* objs[3] = {NULL, NULL, NULL};
+
+  std::thread owner([&]{
+    ponyint_pool_set_waker([](void* arg){
+      wakes.fetch_add(1);
+      woken_arg.store(arg);
+    }, &cookie);
+
+    for(int i = 0; i < 3; i++)
+      objs[i] = (char*)ponyint_pool_alloc(0);
+
+    ponyint_pool_suspend_flush(); // marks this thread asleep
+    stage.store(1);
+
+    while(!done.load())
+      std::this_thread::yield();
+
+    // Drain with the mark kept: the next refill must wake again.
+    ponyint_pool_drain_suspended();
+    stage.store(2);
+
+    while(stage.load() != 3)
+      std::this_thread::yield();
+
+    // Clear the mark: deliveries stop waking.
+    ponyint_pool_drain();
+    stage.store(4);
+
+    while(stage.load() != 5)
+      std::this_thread::yield();
+  });
+
+  while(stage.load() != 1)
+    std::this_thread::yield();
+
+  // Two deliveries while asleep: the first turns the inbox non-empty
+  // and wakes; the second lands on a non-empty inbox and must not.
+  std::thread([&]{
+    ponyint_pool_free(0, objs[0]);
+    ponyint_pool_suspend_flush(); // the flush half: delivers the chain
+  }).join();
+
+  ASSERT_EQ(wakes.load(), 1);
+  ASSERT_EQ(woken_arg.load(), (void*)&cookie);
+
+  std::thread([&]{
+    ponyint_pool_free(0, objs[1]);
+    ponyint_pool_thread_cleanup();
+  }).join();
+
+  ASSERT_EQ(wakes.load(), 1); // non-empty inbox: no second wake
+
+  done.store(true);
+
+  while(stage.load() != 2)
+    std::this_thread::yield();
+
+  // The owner drained with the mark kept; this refill wakes again.
+  std::thread([&]{
+    ponyint_pool_free(0, objs[2]);
+    ponyint_pool_thread_cleanup();
+  }).join();
+
+  ASSERT_EQ(wakes.load(), 2);
+
+  stage.store(3);
+
+  while(stage.load() != 4)
+    std::this_thread::yield();
+
+  // Mark cleared: a delivery must not wake. Reuse an address the owner
+  // got back so there is something to free.
+  std::thread([&]{
+    ponyint_pool_free(0, objs[0]);
+    ponyint_pool_thread_cleanup();
+  }).join();
+
+  ASSERT_EQ(wakes.load(), 2);
+
+  stage.store(5);
+  owner.join();
+  wakes.store(0);
+}
+
+extern "C" bool ponyint_pool_arena_inbox_empty_for_test();
+extern "C" void ponyint_pool_arena_suspend_flush_hook_for_test(
+  void (*fn)(void));
+
+// The one interleaving the flush's re-check exists for: a delivery
+// that lands after the flush's drain but before its mark. The producer
+// sees no mark, so it does not wake; only the re-check can notice the
+// mail. The window is a few instructions wide, so the test holds the
+// flush open in it with the test hook and delivers deterministically.
+TEST(PoolArena, SuspendFlushRecheckWindow)
+{
+  static std::atomic<int> wakes(0);
+  static std::atomic<int> window(0);
+
+  std::atomic<int> stage(0);
+  char* obj = NULL;
+
+  ponyint_pool_arena_suspend_flush_hook_for_test([](){
+    // Runs on the owner, between the drain and the mark. First pass
+    // only: signal the window open and hold until the delivery landed.
+    int expected = 0;
+
+    if(window.compare_exchange_strong(expected, 1))
+    {
+      while(window.load() != 2)
+        std::this_thread::yield();
+    }
+  });
+
+  std::thread owner([&]{
+    ponyint_pool_set_waker([](void*){ wakes.fetch_add(1); }, NULL);
+    obj = (char*)ponyint_pool_alloc(0);
+    stage.store(1);
+
+    while(stage.load() != 2)
+      std::this_thread::yield();
+
+    ponyint_pool_suspend_flush();
+
+    // The flush must have consumed the in-window mail itself: the
+    // producer saw no mark, so no wake fired, and returning marked
+    // with a non-empty inbox would be the stranding.
+    ASSERT_TRUE(ponyint_pool_arena_inbox_empty_for_test());
+    ASSERT_EQ(wakes.load(), 0);
+
+    ponyint_pool_drain();
+    ponyint_pool_set_waker(NULL, NULL);
+  });
+
+  while(stage.load() != 1)
+    std::this_thread::yield();
+
+  stage.store(2); // owner enters the flush; the hook opens the window
+
+  while(window.load() != 1)
+    std::this_thread::yield();
+
+  std::thread([&]{
+    ponyint_pool_free(0, obj);
+    ponyint_pool_thread_cleanup(); // delivery inside the window
+  }).join();
+
+  window.store(2); // window closes; the flush proceeds to mark+recheck
+  owner.join();
+
+  ponyint_pool_arena_suspend_flush_hook_for_test(NULL);
+  wakes.store(0);
+  window.store(0);
+}
+
+// Retiring the waker waits out a producer already inside it, so a
+// teardown can never free state under a running callback.
+TEST(PoolArena, WakerRetireWaitsForProducer)
+{
+  static std::atomic<bool> in_waker(false);
+  static std::atomic<bool> release_waker(false);
+
+  std::atomic<int> stage(0);
+  std::atomic<bool> retire_returned(false);
+  char* obj = NULL;
+
+  std::thread owner([&]{
+    ponyint_pool_set_waker([](void*){
+      in_waker.store(true);
+
+      while(!release_waker.load())
+        std::this_thread::yield();
+    }, NULL);
+
+    obj = (char*)ponyint_pool_alloc(0);
+    ponyint_pool_suspend_flush();
+    stage.store(1);
+
+    while(stage.load() != 2)
+      std::this_thread::yield();
+
+    // Retire while the producer is inside the waker: this must block
+    // until the producer leaves.
+    ponyint_pool_set_waker(NULL, NULL);
+    retire_returned.store(true);
+  });
+
+  while(stage.load() != 1)
+    std::this_thread::yield();
+
+  std::thread producer([&]{
+    ponyint_pool_free(0, obj);
+    ponyint_pool_thread_cleanup(); // delivery fires the blocking waker
+  });
+
+  while(!in_waker.load())
+    std::this_thread::yield();
+
+  stage.store(2); // owner starts the retire now
+
+  // The producer is parked inside the waker; the retire must not have
+  // returned.
+  for(int i = 0; i < 1000; i++)
+  {
+    ASSERT_FALSE(retire_returned.load());
+    std::this_thread::yield();
+  }
+
+  release_waker.store(true);
+  producer.join();
+  owner.join();
+  ASSERT_TRUE(retire_returned.load());
+
+  in_waker.store(false);
+  release_waker.store(false);
+}
+
+// An owner that never registered a waker takes deliveries silently and
+// recovers them on its own next drain.
+TEST(PoolArena, NullWakerDeliverySilent)
+{
+  std::atomic<int> stage(0);
+  char* obj = NULL;
+
+  std::thread owner([&]{
+    obj = (char*)ponyint_pool_alloc(0);
+    ponyint_pool_suspend_flush(); // asleep, no waker
+    stage.store(1);
+
+    while(stage.load() != 2)
+      std::this_thread::yield();
+
+    // The mail sat; the drain recovers it: the slab empties, resets,
+    // and hands the same address back.
+    ponyint_pool_drain();
+    char* again = (char*)ponyint_pool_alloc(0);
+    ASSERT_EQ(again, obj);
+    ponyint_pool_free(0, again);
+  });
+
+  while(stage.load() != 1)
+    std::this_thread::yield();
+
+  std::thread([&]{
+    ponyint_pool_free(0, obj);
+    ponyint_pool_thread_cleanup();
+  }).join();
+
+  stage.store(2);
+  owner.join();
+}
+
 // A slot outlives its thread: a foreign free of an exited owner's
 // object pushes to an inbox nothing will ever drain, and that must be
 // safe — the segment holding it is never freed or moved. The freeing
