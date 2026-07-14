@@ -1219,6 +1219,107 @@ TEST(PoolArenaDeath, FreeIntoFreeUnit)
   }, "UNIT_STATE_HEAD");
 }
 
+// The crediting checks run when an owner drains its inbox, a moment no
+// test can time; this seam credits one run directly. Each test below
+// forges the corruption a hostile or broken freeing thread could put in
+// an inbox and proves the credit refuses it. The layout mirrors
+// run_header_t in pool_arena.c; change both together.
+extern "C" void ponyint_pool_arena_credit_run_for_test(void* run_tail);
+
+namespace
+{
+
+struct forged_run_t
+{
+  void* next_run;
+  void* first;
+  uint16_t len;
+};
+
+} // namespace
+
+// A run whose tail sits in one slab and claims an object from another:
+// the membership walk must refuse the foreign object.
+TEST(PoolArenaDeath, CreditRunObjectOutsideSlab)
+{
+  testing::FLAGS_gtest_death_test_style = "threadsafe";
+
+  EXPECT_DEATH({
+    char* tail = (char*)ponyint_pool_alloc(0);
+    char* outside = (char*)ponyint_pool_alloc(1); // a different slab
+    forged_run_t* h = (forged_run_t*)tail;
+    h->next_run = NULL;
+    h->first = outside;
+    h->len = 2;
+    ponyint_pool_arena_credit_run_for_test(tail);
+  }, "span_bytes");
+}
+
+// A run claiming more objects than the slab has live: the credit must
+// refuse to drive the live count below zero.
+TEST(PoolArenaDeath, CreditRunLenExceedsLive)
+{
+  testing::FLAGS_gtest_death_test_style = "threadsafe";
+
+  EXPECT_DEATH({
+    char* a = (char*)ponyint_pool_alloc(0);
+    char* b = (char*)ponyint_pool_alloc(0);
+    char* c = (char*)ponyint_pool_alloc(0);
+    ponyint_pool_free(0, a); // live drops to two; the run claims three
+    *(void**)a = b;
+    *(void**)b = c;
+    forged_run_t* h = (forged_run_t*)c;
+    h->next_run = NULL;
+    h->first = a;
+    h->len = 3;
+    ponyint_pool_arena_credit_run_for_test(c);
+  }, "live >= len");
+}
+
+// A run whose tail lands in a unit nothing occupies: the credit must
+// refuse a slab that is not there.
+TEST(PoolArenaDeath, CreditRunTailInFreeUnit)
+{
+  testing::FLAGS_gtest_death_test_style = "threadsafe";
+
+  EXPECT_DEATH({
+    void* pin = ponyint_pool_alloc(0); // keeps the arena occupied
+    char* p = (char*)ponyint_pool_alloc_size(2 * 1024 * 1024);
+    ponyint_pool_free_size(2 * 1024 * 1024, p);
+    // The released span's pages were dropped, but the address range
+    // stays mapped: the write refaults fresh pages.
+    forged_run_t* h = (forged_run_t*)p;
+    h->next_run = NULL;
+    h->first = p;
+    h->len = 1;
+    ponyint_pool_arena_credit_run_for_test(p);
+    (void)pin;
+  }, "UNIT_STATE_HEAD");
+}
+
+// A run credited by a thread that does not own the slab's arena: the
+// owner check must refuse it before any bookkeeping is touched. The
+// crediting runs on a spawned thread because the death statement's
+// process inherits this thread's slot, which does own the arena.
+TEST(PoolArenaDeath, CreditRunForeignArena)
+{
+  testing::FLAGS_gtest_death_test_style = "threadsafe";
+
+  char* p = (char*)ponyint_pool_alloc(0);
+
+  EXPECT_DEATH({
+    std::thread([&]{
+      forged_run_t* h = (forged_run_t*)p;
+      h->next_run = NULL;
+      h->first = p;
+      h->len = 1;
+      ponyint_pool_arena_credit_run_for_test(p);
+    }).join();
+  }, "owner_slot == this_thread.slot");
+
+  ponyint_pool_free(0, p);
+}
+
 // A block freed on another thread goes home through the owner's inbox and
 // its units are reused for the next block: the cross-thread stranding that
 // motivated the design, in miniature. On the classic pool this exact churn

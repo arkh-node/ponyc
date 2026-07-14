@@ -110,6 +110,7 @@ typedef struct pool_item_t
 #define BATCH_SIZE 32
 #define NO_OWNER_SLOT UINT32_MAX
 
+/// Mirrored by the pool tests' forged_run_t; change both together.
 typedef struct run_header_t
 {
   struct run_header_t* next_run;
@@ -1351,6 +1352,14 @@ void ponyint_pool_thread_cleanup()
 uint32_t ponyint_pool_arena_owner_slots_for_test()
 {
   return atomic_load_explicit(&next_owner_slot, memory_order_relaxed);
+}
+
+/// Test seam: credits one run exactly as the inbox drain does. The death
+/// tests forge corrupt runs and prove each crediting check refuses them;
+/// a real inbox delivery cannot be timed from a test.
+void ponyint_pool_arena_credit_run_for_test(void* run_tail)
+{
+  apply_run((run_header_t*)run_tail);
 }
 
 #endif
