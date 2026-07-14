@@ -520,18 +520,24 @@ class _ProcessWindows is _Process
 
   fun ref arm_exit_event(owner: AsioEventNotify): AsioEventID =>
     ifdef windows then
-      // Windows has no native exit event yet; the monitor polls exit on a
-      // timer. TODO: register a wait on the process handle via the sock_notify
-      // backend so the completion port delivers an exit event.
-      AsioEvent.none()
+      // Register a wait on the child's process handle. The handle rides in the
+      // event's nsec slot; the readiness backend registers a wait on it and
+      // fires ASIO_READ when the child exits. Arming the event hands the
+      // handle's close to the backend (see close_exit_source and
+      // ponyint_win_process_wait).
+      @pony_asio_event_create(owner, 0, AsioEvent.proc(), h_process.u64(), true)
     else
       compile_error "unsupported platform"
     end
 
   fun ref close_exit_source(event: AsioEventID) =>
     ifdef windows then
-      // No native exit event to release; see arm_exit_event.
-      None
+      // Unsubscribe the exit event. The backend unregisters the wait and closes
+      // the process handle, so there is nothing to close here. Idempotent:
+      // unsubscribe is a no-op on an already-disposed event.
+      if event isnt AsioEvent.none() then
+        @pony_asio_event_unsubscribe(event)
+      end
     else
       compile_error "unsupported platform"
     end
@@ -550,9 +556,9 @@ class _ProcessWindows is _Process
           final_wait_result = wr
           wr
         | 1 => _StillRunning
-        | let code: I32 =>
-          // A wait error. We report WaitpidError rather than surface the
-          // Windows error code, matching the posix path.
+        else
+          // A wait error (the fixed -1 sentinel). We report WaitpidError,
+          // matching the posix path.
           final_wait_result = wr
           wr
         end

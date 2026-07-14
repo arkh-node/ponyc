@@ -2,7 +2,6 @@ use "backpressure"
 use "collections"
 use "files"
 use "promises"
-use "time"
 use @getpid[I32]() if linux
 
 primitive StartProcess
@@ -205,11 +204,6 @@ actor ProcessMonitor is AsioEventNotify
 
   var _state: _Lifecycle = _Running
 
-  // Windows has no native exit event yet, so it polls pipe reads and the
-  // child's exit on a timer. Exit is read from `wait()` (GetExitCodeProcess)
-  // independent of the pipes, so the pipe-close bugs are fixed on Windows too.
-  var _windows_timers: (Timers tag | None) = None
-
   new _create(
     backpressure_auth: ApplyReleaseBackpressureAuth,
     notifier: ProcessNotify iso,
@@ -247,12 +241,6 @@ actor ProcessMonitor is AsioEventNotify
     // edge-triggered notification that readable edge can be missed, so probe
     // once now. A duplicate real event later lands in `_Reaped` and is a no-op.
     _reap_if_exited()
-
-    ifdef windows then
-      if not (_state is _Reaped) then
-        _start_windows_poll()
-      end
-    end
 
   be print(data: ByteSeq) =>
     """
@@ -463,47 +451,6 @@ actor ProcessMonitor is AsioEventNotify
     _stderr.close()
     _err.close()
     _close_exit_source()
-    _dispose_windows_poll()
-
-  fun ref _start_windows_poll() =>
-    ifdef windows then
-      let timers = Timers
-      _windows_timers = timers
-      let pm: ProcessMonitor tag = this
-      let tn =
-        object iso is TimerNotify
-          fun ref apply(timer: Timer, count: U64): Bool =>
-            pm._windows_poll()
-            true
-        end
-      timers(Timer(consume tn, 10_000_000, 10_000_000))
-    end
-
-  be _windows_poll() =>
-    """
-    Poll pipe reads and the child's exit. Windows has no native exit event.
-    """
-    ifdef windows then
-      match \exhaustive\ _state
-      | _Running =>
-        _pending_writes()
-        _read_pipe(_stdout)
-        _read_pipe(_stderr)
-        _read_pipe(_err)
-        _reap_if_exited()
-      | _Disposing =>
-        // pipes are closed; just detect the killed child's exit
-        _reap_if_exited()
-      | _Reaped => None
-      end
-    end
-
-  fun ref _dispose_windows_poll() =>
-    match _windows_timers
-    | let ts: Timers =>
-      ts.dispose()
-      _windows_timers = None
-    end
 
   fun ref _close_stdin() =>
     """

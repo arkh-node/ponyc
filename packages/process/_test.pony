@@ -30,6 +30,7 @@ actor \nodoc\ Main is TestList
     test(_TestWaitingOnClosedProcessTwice)
     // exit detected independent of the child's pipes
     test(_TestGrandchildDoesNotBlockExit)
+    test(_TestWindowsGrandchildDoesNotBlockExit)
     test(_TestStdinOpenChildExits)
     test(_TestGrandchildDeliversBufferedOutput)
     test(_TestChildClosesOutputKeepsRunning)
@@ -327,6 +328,62 @@ class \nodoc\ iso _TestGrandchildDoesNotBlockExit is UnitTest
       h.long_test(10_000_000_000)
     end
 
+class \nodoc\ iso _TestWindowsGrandchildDoesNotBlockExit is UnitTest
+  """
+  #5764 on Windows. cmd launches a long-lived grandchild (ping) with `start /b`,
+  so ping inherits and holds cmd's stdout pipe, then cmd exits 7. The stdout
+  pipe stays open for ping's life, but the exit must be reported promptly from
+  the process-exit event. The 10s timeout is well under ping's ~30s life, so a
+  pass proves exit was detected from the OS, not from the stdout pipe closing.
+  """
+  fun name(): String => "process/windows-grandchild-does-not-block-exit"
+  fun exclusion_group(): String => "process-monitor"
+  fun apply(h: TestHelper) =>
+    ifdef windows then
+      let notifier =
+        object iso is ProcessNotify
+          fun ref failed(process: ProcessMonitor ref, err: ProcessError) =>
+            h.fail("failed: " + err.string())
+            h.complete(false)
+
+          fun ref dispose(process: ProcessMonitor ref,
+            child_exit_status: ProcessExitStatus)
+          =>
+            match child_exit_status
+            | Exited(7) => h.complete(true)
+            else
+              h.fail("expected Exited(7), got " + child_exit_status.string())
+              h.complete(false)
+            end
+        end
+
+      let process_auth = StartProcessAuth(h.env.root)
+      let backpressure_auth = ApplyReleaseBackpressureAuth(h.env.root)
+      let file_auth = FileAuth(h.env.root)
+      let path = FilePath(file_auth, "C:\\Windows\\System32\\cmd.exe")
+      // `start /b` runs ping without a new console, so it inherits cmd's stdout
+      // pipe and keeps it open; cmd then exits 7. A populated environment is
+      // required: cmd's `start /b` hangs when the environment block is empty.
+      let args: Array[String] val =
+        ["cmd"; "/c"; "start /b ping -n 30 127.0.0.1 & exit 7"]
+      let vars: Array[String] val =
+        ["SystemRoot=C:\\Windows"; "PATH=C:\\Windows\\System32"]
+
+      match StartProcess(process_auth, backpressure_auth, consume notifier,
+        path, args, vars)
+      | let pm: ProcessMonitor =>
+        pm.done_writing()
+        h.dispose_when_done(pm)
+      | let err: ProcessError =>
+        h.fail("StartProcess failed: " + err.string())
+        h.complete(false)
+      end
+      h.long_test(10_000_000_000)
+    else
+      // Windows-only; on posix there is nothing to run here.
+      h.complete(true)
+    end
+
 class \nodoc\ iso _TestStdinOpenChildExits is UnitTest
   """
   #5748: the child exits on its own while we still hold its stdin open (we
@@ -585,25 +642,39 @@ class \nodoc\ _TestBadChdir is UnitTest
 
   fun ref apply(h: TestHelper) =>
     let badpath = Path.abs(Path.random(10))
-    let notifier: ProcessNotify iso = _FailAndExitClient(h, ChdirError)
-
     let process_auth = StartProcessAuth(h.env.root)
     let backpressure_auth = ApplyReleaseBackpressureAuth(h.env.root)
     let file_auth = FileAuth(h.env.root)
-
     let path = FilePath(file_auth, _PwdPath())
     let args: Array[String] val = _PwdArgs()
     let vars: Array[String] val = []
+    let bad_wdir = FilePath(file_auth, badpath)
 
-    match StartProcess(process_auth, backpressure_auth, consume notifier,
-      path, args, vars, FilePath(file_auth, badpath))
-    | let pm: ProcessMonitor =>
-      pm.done_writing()
-      h.dispose_when_done(pm)
-    | let err: ProcessError =>
-      h.fail("StartProcess failed: " + err.string())
+    ifdef windows then
+      // Windows CreateProcess fails synchronously for a bad working directory,
+      // so StartProcess returns the error rather than reporting it through the
+      // notifier; there is no fork/exec split to defer it to.
+      let notifier = _NoStartNotify(h)
+      match StartProcess(process_auth, backpressure_auth, consume notifier,
+        path, args, vars, bad_wdir)
+      | let pm: ProcessMonitor =>
+        h.fail("StartProcess should have returned an error")
+        pm.dispose()
+      | let err: ProcessError =>
+        h.assert_true(err.error_type is ChdirError)
+      end
+    else
+      let notifier: ProcessNotify iso = _FailAndExitClient(h, ChdirError)
+      match StartProcess(process_auth, backpressure_auth, consume notifier,
+        path, args, vars, bad_wdir)
+      | let pm: ProcessMonitor =>
+        pm.done_writing()
+        h.dispose_when_done(pm)
+      | let err: ProcessError =>
+        h.fail("StartProcess failed: " + err.string())
+      end
+      h.long_test(30_000_000_000)
     end
-    h.long_test(30_000_000_000)
 
 class \nodoc\ _TestBadExec is UnitTest
   let _bad_exec_sh_contents: String =
@@ -637,21 +708,36 @@ class \nodoc\ _TestBadExec is UnitTest
     try (_tmp_dir as FilePath).remove() end
 
   fun ref apply(h: TestHelper) =>
-    let notifier: ProcessNotify iso = _FailAndExitClient(h, ExecveError)
     try
       let process_auth = StartProcessAuth(h.env.root)
       let backpressure_auth = ApplyReleaseBackpressureAuth(h.env.root)
       let path = _bad_exec_path as FilePath
 
-      match StartProcess(process_auth, backpressure_auth, consume notifier,
-        path, [], [])
-      | let pm: ProcessMonitor =>
-        pm.done_writing()
-        h.dispose_when_done(pm)
-      | let err: ProcessError =>
-        h.fail("StartProcess failed: " + err.string())
+      ifdef windows then
+        // Windows CreateProcess fails synchronously on a non-executable file,
+        // so StartProcess returns the error rather than reporting it through the
+        // notifier.
+        let notifier = _NoStartNotify(h)
+        match StartProcess(process_auth, backpressure_auth, consume notifier,
+          path, [], [])
+        | let pm: ProcessMonitor =>
+          h.fail("StartProcess should have returned an error")
+          pm.dispose()
+        | let err: ProcessError =>
+          h.assert_true(err.error_type is ExecveError)
+        end
+      else
+        let notifier: ProcessNotify iso = _FailAndExitClient(h, ExecveError)
+        match StartProcess(process_auth, backpressure_auth, consume notifier,
+          path, [], [])
+        | let pm: ProcessMonitor =>
+          pm.done_writing()
+          h.dispose_when_done(pm)
+        | let err: ProcessError =>
+          h.fail("StartProcess failed: " + err.string())
+        end
+        h.long_test(30_000_000_000)
       end
-      h.long_test(30_000_000_000)
     else
       h.fail("bad_exec_path not set!")
     end
