@@ -1072,10 +1072,9 @@ void ponyint_pool_drain_suspended()
 {
 }
 
-void ponyint_pool_set_waker(void (*wake)(void*), void* arg)
+void ponyint_pool_set_scheduler(struct scheduler_t* sched)
 {
-  (void)wake;
-  (void)arg;
+  (void)sched;
 }
 
 #endif

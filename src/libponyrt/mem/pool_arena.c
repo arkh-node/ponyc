@@ -4,6 +4,7 @@
 #include "alloc.h"
 #include "ponyassert.h"
 #include "../sched/cpu.h"
+#include "../sched/scheduler.h"
 #include <stdint.h>
 #include <stdbool.h>
 #include <stdlib.h>
@@ -133,32 +134,38 @@ typedef struct run_header_t
   uint16_t len;
 } run_header_t;
 
-/// The callback a delivery uses to wake a sleeping owner.
-typedef void (*pool_waker_fn)(void*);
-
 /* A thread that sleeps for long stretches marks itself asleep in its
  * inbox; a delivery that turns the inbox from empty to non-empty while
- * the mark is set calls the registered waker, once per refill. The
- * sleep race is closed in the seq_cst total order: the owner stores
- * the mark and then re-checks the head; a producer pushes and then
- * loads the mark; one of the two must see the other. Teardown clears
- * the mark, waits until no producer is inside the waker (the pin), and
- * only then retires it, so a waker is never called into freed state.
+ * the mark is set requests a drain wake of the owner's registered
+ * scheduler, once per refill. The sleep race is closed in the seq_cst
+ * total order: the owner stores the mark and then re-checks the head;
+ * a producer pushes and then loads the mark; one of the two must see
+ * the other. Teardown clears the mark, waits until no producer is
+ * inside the wake call (the pin), and only then retires the
+ * registration, so a wake never runs against freed state.
  */
 typedef struct inbox_t
 {
   alignas(64) PONY_ATOMIC(run_header_t*) head;
-  /// The owner is asleep: a delivery that fills the empty inbox calls
-  /// the waker.
+  /// The owner is asleep: a delivery that fills the empty inbox
+  /// requests a drain wake.
   PONY_ATOMIC(uint32_t) sleeping;
-  /// Producers inside (or entering) the waker; teardown waits for zero.
+  /// Producers inside (or entering) the wake call; teardown waits for
+  /// zero.
   PONY_ATOMIC(uint32_t) pins;
-  PONY_ATOMIC(pool_waker_fn) waker;
-  PONY_ATOMIC(void*) waker_arg;
+  /// The scheduler this owner runs, NULL for a thread that is never
+  /// woken for mail.
+  PONY_ATOMIC(scheduler_t*) sched;
 } inbox_t;
 
 pony_static_assert(sizeof(inbox_t) <= 64,
   "an inbox and its wake state share one cache line");
+
+/// Test seam: called inside the pinned wake window at the delivery
+/// site, so a test can hold a producer there or count entries. NULL
+/// outside tests; the window is reached once per refill of a sleeping
+/// owner's inbox.
+static void (*drain_wake_hook)(void);
 
 typedef struct chain_t
 {
@@ -322,10 +329,9 @@ typedef struct pool_arena_thread_t
   uint32_t slot;
   /// This thread's own inbox, cached at slot assignment.
   inbox_t* inbox;
-  /// The waker registered before the slot exists, applied at slot
+  /// The scheduler registered before the slot exists, applied at slot
   /// assignment (slots are lazy).
-  pool_waker_fn waker;
-  void* waker_arg;
+  scheduler_t* sched;
   /// The region this thread last carved from, tried first on the next
   /// carve.
   region_t* current_region;
@@ -569,16 +575,13 @@ static void owner_slot_init()
   this_thread.inbox = inbox_for_slot(slot);
   this_thread.slot = slot;
 
-  // A waker registered before the slot existed applies now. Relaxed
-  // stores: no producer reads them until this thread first declares
-  // itself asleep, and that seq_cst store orders these before it.
-  if(this_thread.waker != NULL)
-  {
-    atomic_store_explicit(&this_thread.inbox->waker, this_thread.waker,
+  // A scheduler registered before the slot existed applies now.
+  // Relaxed store: no producer reads it until this thread first
+  // declares itself asleep, and that seq_cst store orders this before
+  // it.
+  if(this_thread.sched != NULL)
+    atomic_store_explicit(&this_thread.inbox->sched, this_thread.sched,
       memory_order_relaxed);
-    atomic_store_explicit(&this_thread.inbox->waker_arg,
-      this_thread.waker_arg, memory_order_relaxed);
-  }
 }
 
 static region_t* region_of(arena_t* arena)
@@ -1158,9 +1161,9 @@ static void chain_flush(chain_t* c)
   // A push that turned the inbox non-empty wakes a sleeping owner. The
   // push and the sleeping load sit in the seq_cst total order against
   // the owner's mark-then-recheck, so one side always sees the other.
-  // The pin keeps a teardown from retiring the waker under a producer
-  // that already saw the mark: teardown clears sleeping first, so the
-  // re-load after the pin turns late producers away.
+  // The pin keeps a teardown from retiring the registration under a
+  // producer that already saw the mark: teardown clears sleeping
+  // first, so the re-load after the pin turns late producers away.
   if(old == NULL)
   {
     inbox_t* inbox = c->inbox;
@@ -1172,12 +1175,14 @@ static void chain_flush(chain_t* c)
       if(atomic_load_explicit(&inbox->sleeping, memory_order_seq_cst)
         != 0)
       {
-        pool_waker_fn fn = atomic_load_explicit(&inbox->waker,
+        if(drain_wake_hook != NULL)
+          drain_wake_hook();
+
+        scheduler_t* sched = atomic_load_explicit(&inbox->sched,
           memory_order_relaxed);
 
-        if(fn != NULL)
-          fn(atomic_load_explicit(&inbox->waker_arg,
-            memory_order_relaxed));
+        if(sched != NULL)
+          ponyint_sched_drain_wake(sched);
       }
 
       atomic_fetch_sub_explicit(&inbox->pins, 1, memory_order_seq_cst);
@@ -1563,6 +1568,11 @@ static void chains_flush_all()
 /// guards. NULL outside tests; the flush is a cold path.
 static void (*suspend_flush_window_hook)(void);
 
+void ponyint_pool_arena_drain_wake_hook_for_test(void (*fn)(void))
+{
+  drain_wake_hook = fn;
+}
+
 void ponyint_pool_arena_suspend_flush_hook_for_test(void (*fn)(void))
 {
   suspend_flush_window_hook = fn;
@@ -1618,33 +1628,28 @@ void ponyint_pool_drain_suspended()
   inbox_drain();
 }
 
-void ponyint_pool_set_waker(void (*wake)(void*), void* arg)
+void ponyint_pool_set_scheduler(scheduler_t* sched)
 {
-  this_thread.waker = wake;
-  this_thread.waker_arg = arg;
+  this_thread.sched = sched;
 
   if(this_thread.slot == NO_OWNER_SLOT)
     return;
 
   inbox_t* inbox = this_thread.inbox;
 
-  if(wake == NULL)
+  if(sched == NULL)
   {
-    // Retire: stop new producers at the mark, wait out any already
-    // past it, then drop the callback. After this returns, nothing can
-    // call into whatever the callback referenced.
+    // Retire: stop new producers at the mark and wait out any already
+    // past it; the shared store below then drops the registration.
+    // After this returns, no delivery wakes this thread's scheduler
+    // again.
     atomic_store_explicit(&inbox->sleeping, 0, memory_order_seq_cst);
 
     while(atomic_load_explicit(&inbox->pins, memory_order_seq_cst) != 0)
       ponyint_cpu_relax();
-
-    atomic_store_explicit(&inbox->waker, NULL, memory_order_relaxed);
-    atomic_store_explicit(&inbox->waker_arg, NULL, memory_order_relaxed);
-    return;
   }
 
-  atomic_store_explicit(&inbox->waker, wake, memory_order_relaxed);
-  atomic_store_explicit(&inbox->waker_arg, arg, memory_order_relaxed);
+  atomic_store_explicit(&inbox->sched, sched, memory_order_relaxed);
 }
 
 void ponyint_pool_thread_cleanup()
@@ -1659,7 +1664,7 @@ void ponyint_pool_thread_cleanup()
 
   if(this_thread.slot != NO_OWNER_SLOT)
   {
-    ponyint_pool_set_waker(NULL, NULL);
+    ponyint_pool_set_scheduler(NULL);
     inbox_drain();
   }
 

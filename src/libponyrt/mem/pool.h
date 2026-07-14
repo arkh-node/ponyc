@@ -86,14 +86,18 @@ void* ponyint_pool_realloc_size(size_t old_size, size_t new_size, void* p);
 
 void ponyint_pool_thread_cleanup();
 
+struct scheduler_t;
+
 /* The suspend-and-drain interface. A thread that sleeps for long
  * stretches calls suspend_flush before sleeping: pending foreign frees
- * are delivered to their owners (waking any that sleep), its own inbox
- * is drained, and it is marked asleep, so a later delivery into its
- * inbox calls the waker it registered. Wake handling inside a sleep
- * loop calls drain_suspended; leaving suspension for any reason calls
- * drain. Only the arena allocator has inboxes; the other backends
- * define these as no-ops.
+ * are delivered to their owners (waking any sleeping owner that
+ * registered a scheduler), its own inbox is drained, and it is marked
+ * asleep, so a delivery that fills its empty inbox requests a drain
+ * wake of the scheduler it registered. Wake handling inside a sleep
+ * loop calls
+ * drain_suspended; leaving suspension for any reason calls drain. Only
+ * the arena allocator has inboxes; the other backends define these as
+ * no-ops.
  */
 void ponyint_pool_suspend_flush();
 
@@ -101,10 +105,11 @@ void ponyint_pool_drain();
 
 void ponyint_pool_drain_suspended();
 
-/// Registers the callback a delivery uses to wake this thread while it
-/// is marked asleep. NULL retires the callback, waiting out any caller
-/// already inside it.
-void ponyint_pool_set_waker(void (*wake)(void*), void* arg);
+/// Registers the scheduler this thread runs. A delivery that fills
+/// this thread's empty inbox while it is marked asleep requests a
+/// drain wake of that scheduler. NULL retires the registration,
+/// waiting out any producer already inside the wake call.
+void ponyint_pool_set_scheduler(struct scheduler_t* sched);
 
 size_t ponyint_pool_index(size_t size);
 

@@ -1,6 +1,7 @@
 #include <platform.h>
 
 #include <mem/pool.h>
+#include <sched/scheduler.h>
 
 #include <gtest/gtest.h>
 
@@ -1799,16 +1800,26 @@ TEST(PoolArena, FreeOnlyThreadTakesNoSlot)
   ASSERT_EQ(ponyint_pool_arena_owner_slots_for_test(), before + 1);
 }
 
+extern "C" void ponyint_pool_arena_drain_wake_hook_for_test(
+  void (*fn)(void));
+
 // The suspend-and-drain protocol, owner side and producer side. The
 // owner marks itself asleep with suspend_flush; a delivery that turns
-// its inbox non-empty calls the waker the owner registered, once per
-// refill. The producer-side waker runs on the freeing thread, so the
-// test waker just counts.
+// its inbox non-empty requests a drain wake of the scheduler the owner
+// registered, once per refill. The scheduler is a zeroed fake: with no
+// thread id, the wake sets drain_requested and sends no signal, so the
+// flag records a request. The hook counts entries to the wake window,
+// keeping the once-per-refill assertion exact.
 TEST(PoolArena, SuspendFlushWakes)
 {
-  static std::atomic<int> wakes(0);
-  static std::atomic<void*> woken_arg(NULL);
-  int cookie = 0;
+  static std::atomic<int> window_entries(0);
+
+  scheduler_t fake;
+  memset(&fake, 0, sizeof(fake));
+
+  ponyint_pool_arena_drain_wake_hook_for_test([](){
+    window_entries.fetch_add(1);
+  });
 
   std::atomic<int> stage(0);
   std::atomic<bool> done(false);
@@ -1816,10 +1827,9 @@ TEST(PoolArena, SuspendFlushWakes)
   char* fresh = NULL;
 
   std::thread owner([&]{
-    ponyint_pool_set_waker([](void* arg){
-      wakes.fetch_add(1);
-      woken_arg.store(arg);
-    }, &cookie);
+    // Deliberately before the first allocation: this registration goes
+    // through the pre-slot stash and is applied at slot creation.
+    ponyint_pool_set_scheduler(&fake);
 
     for(int i = 0; i < 3; i++)
       objs[i] = (char*)ponyint_pool_alloc(0);
@@ -1847,8 +1857,8 @@ TEST(PoolArena, SuspendFlushWakes)
     while(stage.load() != 5)
       std::this_thread::yield();
 
-    // Retires the waker and drains the last delivery, so the exiting
-    // thread's inbox holds nothing.
+    // Retires the registration and drains the last delivery, so the
+    // exiting thread's inbox holds nothing.
     ponyint_pool_thread_cleanup();
   });
 
@@ -1863,15 +1873,18 @@ TEST(PoolArena, SuspendFlushWakes)
     ponyint_pool_thread_cleanup();
   }).join();
 
-  ASSERT_EQ(wakes.load(), 1);
-  ASSERT_EQ(woken_arg.load(), (void*)&cookie);
+  ASSERT_TRUE(fake.drain_requested);
+  ASSERT_EQ(window_entries.load(), 1);
+  fake.drain_requested = false;
 
   std::thread([&]{
     ponyint_pool_free(0, objs[1]);
     ponyint_pool_thread_cleanup();
   }).join();
 
-  ASSERT_EQ(wakes.load(), 1); // non-empty inbox: no second wake
+  // Non-empty inbox: no second wake.
+  ASSERT_FALSE(fake.drain_requested);
+  ASSERT_EQ(window_entries.load(), 1);
 
   done.store(true);
 
@@ -1884,7 +1897,9 @@ TEST(PoolArena, SuspendFlushWakes)
     ponyint_pool_thread_cleanup();
   }).join();
 
-  ASSERT_EQ(wakes.load(), 2);
+  ASSERT_TRUE(fake.drain_requested);
+  ASSERT_EQ(window_entries.load(), 2);
+  fake.drain_requested = false;
 
   stage.store(3);
 
@@ -1898,11 +1913,14 @@ TEST(PoolArena, SuspendFlushWakes)
     ponyint_pool_thread_cleanup();
   }).join();
 
-  ASSERT_EQ(wakes.load(), 2);
+  ASSERT_FALSE(fake.drain_requested);
+  ASSERT_EQ(window_entries.load(), 2);
 
   stage.store(5);
   owner.join();
-  wakes.store(0);
+
+  ponyint_pool_arena_drain_wake_hook_for_test(NULL);
+  window_entries.store(0);
 }
 
 extern "C" bool ponyint_pool_arena_inbox_empty_for_test();
@@ -1916,8 +1934,15 @@ extern "C" void ponyint_pool_arena_suspend_flush_hook_for_test(
 // flush open in it with the test hook and delivers deterministically.
 TEST(PoolArena, SuspendFlushRecheckWindow)
 {
-  static std::atomic<int> wakes(0);
+  static std::atomic<int> window_entries(0);
   static std::atomic<int> window(0);
+
+  scheduler_t fake;
+  memset(&fake, 0, sizeof(fake));
+
+  ponyint_pool_arena_drain_wake_hook_for_test([](){
+    window_entries.fetch_add(1);
+  });
 
   std::atomic<int> stage(0);
   char* obj = NULL;
@@ -1935,7 +1960,7 @@ TEST(PoolArena, SuspendFlushRecheckWindow)
   });
 
   std::thread owner([&]{
-    ponyint_pool_set_waker([](void*){ wakes.fetch_add(1); }, NULL);
+    ponyint_pool_set_scheduler(&fake);
     obj = (char*)ponyint_pool_alloc(0);
     stage.store(1);
 
@@ -1948,10 +1973,11 @@ TEST(PoolArena, SuspendFlushRecheckWindow)
     // producer saw no mark, so no wake fired, and returning marked
     // with a non-empty inbox would strand the mail.
     ASSERT_TRUE(ponyint_pool_arena_inbox_empty_for_test());
-    ASSERT_EQ(wakes.load(), 0);
+    ASSERT_FALSE(fake.drain_requested);
+    ASSERT_EQ(window_entries.load(), 0);
 
     ponyint_pool_drain();
-    ponyint_pool_set_waker(NULL, NULL);
+    ponyint_pool_set_scheduler(NULL);
   });
 
   while(stage.load() != 1)
@@ -1971,29 +1997,36 @@ TEST(PoolArena, SuspendFlushRecheckWindow)
   owner.join();
 
   ponyint_pool_arena_suspend_flush_hook_for_test(NULL);
-  wakes.store(0);
+  ponyint_pool_arena_drain_wake_hook_for_test(NULL);
+  window_entries.store(0);
   window.store(0);
 }
 
-// Retiring the waker waits out a producer already inside it, so a
-// teardown can never free state under a running callback.
-TEST(PoolArena, WakerRetireWaitsForProducer)
+// Retiring the registration waits out a producer already inside the
+// wake window, so a teardown can never free the scheduler under a
+// producer's wake call. The hook parks the producer in the window.
+TEST(PoolArena, RetireWaitsForProducer)
 {
-  static std::atomic<bool> in_waker(false);
-  static std::atomic<bool> release_waker(false);
+  static std::atomic<bool> in_window(false);
+  static std::atomic<bool> release_window(false);
+
+  scheduler_t fake;
+  memset(&fake, 0, sizeof(fake));
+
+  ponyint_pool_arena_drain_wake_hook_for_test([](){
+    in_window.store(true);
+
+    while(!release_window.load())
+      std::this_thread::yield();
+  });
 
   std::atomic<int> stage(0);
+  std::atomic<bool> entering_retire(false);
   std::atomic<bool> retire_returned(false);
   char* obj = NULL;
 
   std::thread owner([&]{
-    ponyint_pool_set_waker([](void*){
-      in_waker.store(true);
-
-      while(!release_waker.load())
-        std::this_thread::yield();
-    }, NULL);
-
+    ponyint_pool_set_scheduler(&fake);
     obj = (char*)ponyint_pool_alloc(0);
     ponyint_pool_suspend_flush();
     stage.store(1);
@@ -2001,9 +2034,10 @@ TEST(PoolArena, WakerRetireWaitsForProducer)
     while(stage.load() != 2)
       std::this_thread::yield();
 
-    // Retire while the producer is inside the waker: this must block
-    // until the producer leaves.
-    ponyint_pool_set_waker(NULL, NULL);
+    // Retire while the producer is inside the wake window: this must
+    // block until the producer leaves.
+    entering_retire.store(true);
+    ponyint_pool_set_scheduler(NULL);
     retire_returned.store(true);
   });
 
@@ -2012,41 +2046,45 @@ TEST(PoolArena, WakerRetireWaitsForProducer)
 
   std::thread producer([&]{
     ponyint_pool_free(0, obj);
-    ponyint_pool_thread_cleanup(); // delivery fires the blocking waker
+    ponyint_pool_thread_cleanup(); // delivery parks in the wake window
   });
 
-  while(!in_waker.load())
+  while(!in_window.load())
     std::this_thread::yield();
 
   stage.store(2); // owner starts the retire now
 
-  // The producer is parked inside the waker; the retire must not have
-  // returned.
+  while(!entering_retire.load())
+    std::this_thread::yield();
+
+  // The producer is parked inside the wake window; the retire must
+  // not have returned.
   for(int i = 0; i < 1000; i++)
   {
     ASSERT_FALSE(retire_returned.load());
     std::this_thread::yield();
   }
 
-  release_waker.store(true);
+  release_window.store(true);
   producer.join();
   owner.join();
-  ASSERT_TRUE(retire_returned.load());
 
-  in_waker.store(false);
-  release_waker.store(false);
+  ponyint_pool_arena_drain_wake_hook_for_test(NULL);
+  in_window.store(false);
+  release_window.store(false);
 }
 
-// An owner that never registered a waker takes deliveries silently and
-// recovers them on its own next drain.
-TEST(PoolArena, NullWakerDeliverySilent)
+// An owner that never registered a scheduler takes deliveries silently
+// and recovers them on its own next drain — the ASIO and tracing
+// threads' arrangement.
+TEST(PoolArena, NoSchedulerDeliverySilent)
 {
   std::atomic<int> stage(0);
   char* obj = NULL;
 
   std::thread owner([&]{
     obj = (char*)ponyint_pool_alloc(0);
-    ponyint_pool_suspend_flush(); // asleep, no waker
+    ponyint_pool_suspend_flush(); // asleep, nothing registered
     stage.store(1);
 
     while(stage.load() != 2)
@@ -2072,19 +2110,20 @@ TEST(PoolArena, NullWakerDeliverySilent)
   owner.join();
 }
 
-// A waker registered after the thread's slot already exists applies
-// immediately, not through the pre-slot stash: the runtime's main
-// thread registers after it has long been allocating.
-TEST(PoolArena, WakerRegisteredAfterSlot)
+// A scheduler registered after the thread's slot already exists
+// applies immediately, not through the pre-slot stash: the runtime's
+// main thread registers after it has long been allocating.
+TEST(PoolArena, SchedulerRegisteredAfterSlot)
 {
-  static std::atomic<int> wakes(0);
+  scheduler_t fake;
+  memset(&fake, 0, sizeof(fake));
 
   std::atomic<int> stage(0);
   char* obj = NULL;
 
   std::thread owner([&]{
     obj = (char*)ponyint_pool_alloc(0); // slot exists first
-    ponyint_pool_set_waker([](void*){ wakes.fetch_add(1); }, NULL);
+    ponyint_pool_set_scheduler(&fake);
     ponyint_pool_suspend_flush();
     stage.store(1);
 
@@ -2092,7 +2131,7 @@ TEST(PoolArena, WakerRegisteredAfterSlot)
       std::this_thread::yield();
 
     ponyint_pool_drain();
-    ponyint_pool_set_waker(NULL, NULL);
+    ponyint_pool_set_scheduler(NULL);
   });
 
   while(stage.load() != 1)
@@ -2103,11 +2142,10 @@ TEST(PoolArena, WakerRegisteredAfterSlot)
     ponyint_pool_thread_cleanup();
   }).join();
 
-  ASSERT_EQ(wakes.load(), 1);
+  ASSERT_TRUE(fake.drain_requested);
 
   stage.store(2);
   owner.join();
-  wakes.store(0);
 }
 
 // A slot outlives its thread: a foreign free of an exited owner's

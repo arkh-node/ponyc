@@ -336,12 +336,14 @@ static void sched_wake(scheduler_t* sched, sched_wake_reason_t reason)
 #endif
 }
 
-/// The waker scheduler threads register with the allocator: a
-/// delivery into a suspended thread's inbox calls it to request a
-/// drain wake.
-static void sched_drain_waker(void* arg)
+/// Sets sched's drain flag and delivers the suspension system's wake
+/// where the arm has one. It does not wait for the wake to be
+/// delivered or acted on; the pthreads arm briefly takes sched_mut
+/// (the lost-signal protocol), so it can wait behind a suspension
+/// critical section.
+void ponyint_sched_drain_wake(scheduler_t* sched)
 {
-  sched_wake((scheduler_t*)arg, SCHED_WAKE_DRAIN);
+  sched_wake(sched, SCHED_WAKE_DRAIN);
 }
 
 static void signal_suspended_threads(uint32_t sched_count, int32_t curr_sched_id)
@@ -953,8 +955,8 @@ static pony_actor_t* perhaps_suspend_scheduler(
   {
     // Deliver pending foreign frees, take back what others delivered
     // here, and mark this thread asleep for wake-on-delivery — before
-    // any lock: the flush can fire other owners' wakers, and on the
-    // pthreads arm a waker takes sched_mut.
+    // any lock: the flush can fire other owners' drain wakes, and on
+    // the pthreads arm a drain wake takes sched_mut.
     ponyint_pool_suspend_flush();
 
     if (
@@ -1432,7 +1434,7 @@ static DECLARE_THREAD_FN(run_thread)
   // A delivery into this thread's allocator inbox while it is
   // suspended wakes it to drain. Retired by ponyint_pool_thread_cleanup
   // at thread exit, before the join that precedes any teardown.
-  ponyint_pool_set_waker(sched_drain_waker, sched);
+  ponyint_pool_set_scheduler(sched);
 
 #if !defined(PLATFORM_IS_WINDOWS) && !defined(USE_SCHEDULER_SCALING_PTHREADS)
   // Make sure we block signals related to scheduler sleeping/waking
@@ -1600,7 +1602,7 @@ static void run_pinned_actors()
   // shutdown; the pinned scheduler_t and its sleep object outlive the
   // scheduler array teardown, so a straggler producer in that window
   // touches only live state.
-  ponyint_pool_set_waker(sched_drain_waker, sched);
+  ponyint_pool_set_scheduler(sched);
 
 #if defined(USE_SYSTEMATIC_TESTING)
   // start processing

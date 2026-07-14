@@ -193,6 +193,10 @@ void ponyint_sched_maybe_wakeup(int32_t current_scheduler_id);
 // threads are asleep
 void ponyint_sched_maybe_wakeup_if_all_asleep(int32_t current_scheduler_id);
 
+// Wake a suspended thread to drain its allocator inbox, without making
+// it active.
+void ponyint_sched_drain_wake(scheduler_t* sched);
+
 #ifdef USE_RUNTIMESTATS
 bool ponyint_sched_print_stats();
 

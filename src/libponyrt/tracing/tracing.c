@@ -1107,9 +1107,9 @@ static void perhaps_suspend_tracing_thread()
 {
   // This thread frees other threads' trace messages continuously;
   // deliver the pending chains before sleeping so their owners can
-  // reclaim (waking them if they sleep). It registers no waker of its
-  // own; mail for it waits for the next pass through here, or for the
-  // drain on wake below.
+  // reclaim (waking a sleeping owner that registered a scheduler). It
+  // registers no scheduler of its own; mail for it waits for the next
+  // pass through here, or for the drain on wake below.
   ponyint_pool_suspend_flush();
 
   // if we're not terminating
