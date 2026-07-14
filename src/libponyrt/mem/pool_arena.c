@@ -92,20 +92,22 @@ typedef struct pool_item_t
  * object; this allocator's minimum is 32 bytes, and carrying the pointer
  * means the freeing thread never reads a slab record at all.)
  *
- * Owners are slots in fixed global arrays rather than pointers to
+ * Owners are slots in a global registry rather than pointers to
  * thread-local state: a producer may push to an owner whose thread has
  * already exited, and a slot outlives its thread where thread-local
  * storage does not. Slots are never reused, because reuse would need
  * proof that no other thread still holds the slot in a chain or is about
- * to push to its inbox. The cost is a hard cap: a process gets MAX_OWNERS
- * distinct allocator-using threads over its whole life, and the next one
- * aborts. The runtime's own threads are far below the cap; an embedding
- * that churns short-lived allocator-using threads is the case that could
- * reach it.
+ * to push to its inbox. The registry is a linked list of fixed-size
+ * segments, appended with a compare-and-swap when slots outgrow it and
+ * never moved or freed, so a resolved inbox pointer stays valid for the
+ * life of the process. A thread takes a slot when it reserves its first
+ * arena, not when it first touches the allocator: a thread that only
+ * frees owns nothing another thread could address, so it needs no slot.
+ * An exited thread's slot leaves its inbox slot behind — a cache line in
+ * a segment — as the price of never proving reuse safe.
  */
 
 #define BATCH_SIZE 32
-#define MAX_OWNERS 1024
 #define NO_OWNER_SLOT UINT32_MAX
 
 typedef struct run_header_t
@@ -115,19 +117,72 @@ typedef struct run_header_t
   uint16_t len;
 } run_header_t;
 
-typedef struct chain_t
-{
-  pool_item_t* head;
-  uint32_t count;
-} chain_t;
-
 typedef struct inbox_t
 {
   alignas(64) PONY_ATOMIC(run_header_t*) head;
 } inbox_t;
 
-static inbox_t inboxes[MAX_OWNERS];
+typedef struct chain_t
+{
+  /// The owner's inbox, resolved once when the entry is created. NULL
+  /// marks an empty map entry.
+  inbox_t* inbox;
+  pool_item_t* head;
+  uint32_t owner_slot;
+  uint32_t count;
+} chain_t;
+
+/// Inboxes per registry segment. A segment is one virt_alloc call; the
+/// inboxes' cache-line alignment makes it SEGMENT_SLOTS cache lines plus
+/// a link. Mirrored by the PoolArena tests' TEST_SEGMENT_SLOTS; change
+/// both together.
+#define SEGMENT_SLOTS 256
+
+typedef struct inbox_segment_t
+{
+  inbox_t inboxes[SEGMENT_SLOTS];
+  PONY_ATOMIC(struct inbox_segment_t*) next;
+} inbox_segment_t;
+
+static PONY_ATOMIC(inbox_segment_t*) segments_head;
 static PONY_ATOMIC(uint32_t) next_owner_slot;
+
+/// The inbox for a slot, walking the segment list and appending missing
+/// segments. An append races benignly: the loser frees its segment and
+/// takes the winner's. Only slot assignment ever appends in practice — a
+/// freeing thread resolves a slot it read from an arena header, and the
+/// slot's owner created the segment before stamping any arena — but the
+/// grow branch is correct from any caller.
+static inbox_t* inbox_for_slot(uint32_t slot)
+{
+  PONY_ATOMIC(inbox_segment_t*)* link = &segments_head;
+  inbox_segment_t* seg = atomic_load_explicit(link, memory_order_acquire);
+  uint32_t hops = slot / SEGMENT_SLOTS;
+
+  while(true)
+  {
+    if(seg == NULL)
+    {
+      // Fresh mappings are zeroed, so the segment's inbox heads and link
+      // are valid the moment the CAS publishes it.
+      inbox_segment_t* fresh =
+        (inbox_segment_t*)ponyint_virt_alloc(sizeof(inbox_segment_t));
+
+      if(atomic_compare_exchange_strong_explicit(link, &seg, fresh,
+        memory_order_release, memory_order_acquire))
+        seg = fresh;
+      else
+        ponyint_virt_free(fresh, sizeof(inbox_segment_t));
+    }
+
+    if(hops == 0)
+      return &seg->inboxes[slot % SEGMENT_SLOTS];
+
+    hops--;
+    link = &seg->next;
+    seg = atomic_load_explicit(link, memory_order_acquire);
+  }
+}
 
 typedef struct arena_unit_t
 {
@@ -208,19 +263,28 @@ typedef struct oversized_t
 
 typedef struct pool_arena_thread_t
 {
-  bool init;
+  /// This thread's owner slot, NO_OWNER_SLOT until its first arena.
   uint32_t slot;
+  /// This thread's own inbox, cached at slot assignment.
+  inbox_t* inbox;
   /// Owned arenas.
   arena_t* arenas;
   /// The slab each size class is currently allocating from.
   arena_unit_t* class_slab[POOL_COUNT];
   /// Slabs with space, per class, excluding the current slab.
   arena_unit_t* partial_slabs[POOL_COUNT];
-  /// Foreign objects not yet handed to their owners, one chain per owner.
-  chain_t chains[MAX_OWNERS];
+  /// Foreign objects not yet handed to their owners: an open-addressing
+  /// map keyed by owner slot, grown by doubling. Most threads free to a
+  /// handful of owners; the map stays a page until they don't.
+  chain_t* chains;
+  uint32_t chain_cap;
+  uint32_t chain_used;
 } pool_arena_thread_t;
 
-static __pony_thread_local pool_arena_thread_t this_thread;
+static __pony_thread_local pool_arena_thread_t this_thread =
+{
+  .slot = NO_OWNER_SLOT
+};
 
 /// Load-bearing checks stay in release builds: the allocator unmaps memory
 /// on the strength of this bookkeeping, so a corrupt count or list must
@@ -425,27 +489,29 @@ static size_t bitmap_find_span(arena_t* arena, size_t span)
   return ARENA_UNITS;
 }
 
-static void thread_init()
+/// Assigns this thread's owner slot on its first arena. Resolving the
+/// inbox here creates the slot's segment, so the segment exists before
+/// any arena carries the slot.
+static void owner_slot_init()
 {
-  if(this_thread.init)
+  if(this_thread.slot != NO_OWNER_SLOT)
     return;
 
   uint32_t slot = atomic_fetch_add_explicit(&next_owner_slot, 1,
     memory_order_relaxed);
 
-  if(slot >= MAX_OWNERS)
-  {
-    fprintf(stderr, "pool_arena: more than %d threads used the allocator; "
-      "slots are never reused\n", MAX_OWNERS);
-    abort();
-  }
+  // The sentinel is the only unusable slot; reaching it would take four
+  // billion allocator-using threads over the process's life.
+  ARENA_CHECK(slot != NO_OWNER_SLOT);
 
+  this_thread.inbox = inbox_for_slot(slot);
   this_thread.slot = slot;
-  this_thread.init = true;
 }
 
 static arena_t* arena_new()
 {
+  owner_slot_init();
+
   arena_t* arena = (arena_t*)ponyint_virt_reserve_aligned(ARENA_SIZE);
 
   if(arena == NULL)
@@ -733,29 +799,100 @@ static void slab_after_free(arena_t* arena, arena_unit_t* rec, size_t index,
   }
 }
 
-static void chain_flush(uint32_t owner);
+/// First chain-map capacity: one page of entries. Growth doubles.
+/// Mirrored by the PoolArena tests' TEST_CHAIN_MAP_INITIAL; change both
+/// together.
+#define CHAIN_MAP_INITIAL 128
+
+/// The entry an owner hashes to: its own, or the empty entry that ends
+/// its probe run. The capacity is a power of two and the map is kept at
+/// most half full, so a probe run always ends.
+static chain_t* chain_map_probe(chain_t* map, uint32_t cap, uint32_t owner)
+{
+  uint32_t mask = cap - 1;
+  uint32_t i = (owner * 0x9E3779B1u) & mask;
+
+  while((map[i].inbox != NULL) && (map[i].owner_slot != owner))
+    i = (i + 1) & mask;
+
+  return &map[i];
+}
+
+/// Doubles the chain map (or creates it). Runs on the free path when a
+/// thread meets a new owner; ponyint_virt_alloc aborts the process if
+/// the system is too far gone to give it a page.
+static void chain_map_grow()
+{
+  chain_t* old = this_thread.chains;
+  uint32_t old_cap = this_thread.chain_cap;
+  uint32_t cap = (old == NULL) ? CHAIN_MAP_INITIAL : (old_cap * 2);
+
+  // Fresh mappings are zeroed: every new entry starts empty.
+  chain_t* map = (chain_t*)ponyint_virt_alloc(cap * sizeof(chain_t));
+
+  for(uint32_t i = 0; i < old_cap; i++)
+  {
+    if(old[i].inbox != NULL)
+      *chain_map_probe(map, cap, old[i].owner_slot) = old[i];
+  }
+
+  this_thread.chains = map;
+  this_thread.chain_cap = cap;
+
+  if(old != NULL)
+    ponyint_virt_free(old, old_cap * sizeof(chain_t));
+}
+
+/// The chain entry for an owner, created on first use.
+static chain_t* chain_for_owner(uint32_t owner)
+{
+  if(this_thread.chains != NULL)
+  {
+    chain_t* c = chain_map_probe(this_thread.chains, this_thread.chain_cap,
+      owner);
+
+    if(c->inbox != NULL)
+      return c;
+  }
+
+  // A new entry. Grow first when the insert would pass half full, so
+  // probe runs stay short.
+  if((this_thread.chains == NULL) ||
+    (((this_thread.chain_used + 1) * 2) > this_thread.chain_cap))
+    chain_map_grow();
+
+  chain_t* c = chain_map_probe(this_thread.chains, this_thread.chain_cap,
+    owner);
+
+  c->inbox = inbox_for_slot(owner);
+  c->owner_slot = owner;
+  c->head = NULL;
+  c->count = 0;
+  this_thread.chain_used++;
+  return c;
+}
+
+static void chain_flush(chain_t* c);
 
 /// A free of another thread's object: hold it on that owner's chain, and
 /// hand the chain over once it reaches a batch.
 static void chain_push(uint32_t owner, void* p)
 {
-  chain_t* c = &this_thread.chains[owner];
+  chain_t* c = chain_for_owner(owner);
   pool_item_t* item = (pool_item_t*)p;
   item->next = c->head;
   c->head = item;
   c->count++;
 
   if(c->count >= BATCH_SIZE)
-    chain_flush(owner);
+    chain_flush(c);
 }
 
 /// Sorts a chain into runs — one per unit, which is one per slab — and
 /// pushes the linked runs onto the owner's inbox with one atomic
 /// compare-and-swap, paying one atomic for the whole batch.
-static void chain_flush(uint32_t owner)
+static void chain_flush(chain_t* c)
 {
-  chain_t* c = &this_thread.chains[owner];
-
   if(c->head == NULL)
     return;
 
@@ -819,7 +956,7 @@ static void chain_flush(uint32_t owner)
   // list's tail: the old inbox content hangs off it.
   run_header_t* list_tail = (run_header_t*)groups[0].tail;
 
-  PONY_ATOMIC(run_header_t*)* head = &inboxes[owner].head;
+  PONY_ATOMIC(run_header_t*)* head = &c->inbox->head;
   run_header_t* old = atomic_load_explicit(head, memory_order_relaxed);
 
   do
@@ -894,8 +1031,13 @@ static void apply_run(run_header_t* h)
 /// anything new.
 static void inbox_drain()
 {
+  // A thread with no slot owns no arenas, so no other thread can have
+  // freed anything addressed to it.
+  if(this_thread.slot == NO_OWNER_SLOT)
+    return;
+
   run_header_t* h = atomic_exchange_explicit(
-    &inboxes[this_thread.slot].head, NULL, memory_order_acquire);
+    &this_thread.inbox->head, NULL, memory_order_acquire);
 
   while(h != NULL)
   {
@@ -909,7 +1051,6 @@ static void inbox_drain()
 void* ponyint_pool_alloc(size_t index)
 {
   pony_assert(index < POOL_COUNT);
-  thread_init();
 
   arena_unit_t* rec = this_thread.class_slab[index];
 
@@ -951,7 +1092,6 @@ void* ponyint_pool_alloc(size_t index)
 void ponyint_pool_free(size_t index, void* p)
 {
   pony_assert(index < POOL_COUNT);
-  thread_init();
 
   arena_t* arena = arena_of(p);
   ARENA_CHECK(arena->kind == MAPPING_ARENA);
@@ -996,7 +1136,6 @@ static void* pool_block_alloc(size_t adjusted)
 {
   size_t span = (adjusted + UNIT_SIZE - 1) >> UNIT_BITS;
 
-  thread_init();
   inbox_drain();
 
   arena_unit_t* rec = slab_reserve(span, SLAB_CLASS_BLOCK);
@@ -1119,8 +1258,6 @@ void ponyint_pool_free_size(size_t size, void* p)
   if(index < POOL_COUNT)
     return ponyint_pool_free(index, p);
 
-  thread_init();
-
   arena_t* arena = arena_of(p);
 
   if(arena->kind == MAPPING_OVERSIZED)
@@ -1189,24 +1326,31 @@ void* ponyint_pool_realloc_size(size_t old_size, size_t new_size, void* p)
 
 void ponyint_pool_thread_cleanup()
 {
-  if(!this_thread.init)
+  chain_t* map = this_thread.chains;
+
+  if(map == NULL)
     return;
 
-  // Deliver every pending foreign free to its owner. Nothing else happens
-  // at thread exit: the allocator leaves its own memory in place, because
-  // threads exit in no fixed order and unmapping could hit memory another
-  // thread still uses.
-  uint32_t owners = atomic_load_explicit(&next_owner_slot,
-    memory_order_relaxed);
-
-  if(owners > MAX_OWNERS)
-    owners = MAX_OWNERS;
-
-  for(uint32_t slot = 0; slot < owners; slot++)
+  // Deliver every pending foreign free to its owner, then drop the map.
+  // Nothing else happens at thread exit: the allocator leaves its own
+  // memory in place, because threads exit in no fixed order and
+  // unmapping could hit memory another thread still uses.
+  for(uint32_t i = 0; i < this_thread.chain_cap; i++)
   {
-    if(this_thread.chains[slot].head != NULL)
-      chain_flush(slot);
+    if(map[i].inbox != NULL)
+      chain_flush(&map[i]);
   }
+
+  ponyint_virt_free(map, this_thread.chain_cap * sizeof(chain_t));
+  this_thread.chains = NULL;
+  this_thread.chain_cap = 0;
+  this_thread.chain_used = 0;
+}
+
+/// Test seam: the number of owner slots assigned so far.
+uint32_t ponyint_pool_arena_owner_slots_for_test()
+{
+  return atomic_load_explicit(&next_owner_slot, memory_order_relaxed);
 }
 
 #endif

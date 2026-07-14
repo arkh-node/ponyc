@@ -856,9 +856,10 @@ TEST(Pool, LiveRecordChurn)
 
 #ifdef POOL_USE_ARENA
 
-/* The arena backend's own geometry. These constants mirror pool_arena.c
- * (which cannot export them without widening its interface); if the unit
- * or arena size changes there, these tests change in the same PR.
+/* The arena backend's own geometry and registry sizing. These constants
+ * mirror pool_arena.c (which cannot export them without widening its
+ * interface); if a value changes there, these tests change in the same
+ * PR.
  */
 #ifdef PLATFORM_IS_ILP32
 #define TEST_ARENA_SIZE ((size_t)16 * 1024 * 1024)
@@ -867,6 +868,8 @@ TEST(Pool, LiveRecordChurn)
 #endif
 #define TEST_UNIT_SIZE ((size_t)16 * 1024)
 #define TEST_SWEEP_THRESHOLD ((TEST_ARENA_SIZE / TEST_UNIT_SIZE) / 4)
+#define TEST_SEGMENT_SLOTS 256
+#define TEST_CHAIN_MAP_INITIAL 128
 
 namespace
 {
@@ -1364,6 +1367,183 @@ TEST(PoolArena, CrossThreadManyOwners)
 
   for(int t = 0; t < owners; t++)
     owner_threads[t].join();
+}
+
+extern "C" uint32_t ponyint_pool_arena_owner_slots_for_test();
+
+// The owner registry grows a segment at a time as threads take slots,
+// and resolving a slot's inbox walks the segment links to reach it. Two
+// owners whose slots differ by exactly one segment must get distinct
+// inboxes: a walk that resolves within the wrong segment lands both
+// owners on one inbox, and whichever drains first exchanges runs
+// addressed to the other, which the crediting checks refuse. Delivery
+// to both owners proves the walk and the append.
+TEST(PoolArena, OwnerRegistryGrowth)
+{
+  static const size_t cap = 16 * 1024 / 32;
+
+  struct Owner
+  {
+    std::vector<char*> objs;
+    std::atomic<int> stage;
+    std::atomic<bool> freed;
+    std::thread thread;
+  };
+
+  Owner owners[2];
+  uint32_t before = ponyint_pool_arena_owner_slots_for_test();
+
+  auto spawn = [&](Owner& o)
+  {
+    o.stage.store(0);
+    o.freed.store(false);
+    o.thread = std::thread([&o]{
+      // Fill slab A exactly, plus one to move the current slab off it.
+      for(size_t i = 0; i < (cap + 1); i++)
+        o.objs.push_back((char*)ponyint_pool_alloc(0));
+
+      o.stage.store(1);
+
+      while(!o.freed.load())
+        std::this_thread::yield();
+
+      // The drain credits the foreign frees: slab A empties, releases,
+      // and its unit is re-carved for another class at the same
+      // address.
+      char* recarved = (char*)ponyint_pool_alloc_size(16 * 1024);
+      ASSERT_EQ(recarved, o.objs[0]);
+
+      ponyint_pool_free_size(16 * 1024, recarved);
+      ponyint_pool_free(0, o.objs[cap]);
+    });
+
+    while(o.stage.load() != 1)
+      std::this_thread::yield();
+  };
+
+  spawn(owners[0]);
+
+  // Slots are taken at a thread's first arena and never reused, so each
+  // filler advances the count by one and the second owner's slot lands
+  // exactly one segment past the first owner's.
+  for(size_t i = 0; i < (TEST_SEGMENT_SLOTS - 1); i++)
+  {
+    std::thread([]{
+      void* p = ponyint_pool_alloc(0);
+      ponyint_pool_free(0, p);
+    }).join();
+  }
+
+  spawn(owners[1]);
+
+  ASSERT_EQ(ponyint_pool_arena_owner_slots_for_test(),
+    before + TEST_SEGMENT_SLOTS + 1);
+
+  // One thread frees both owners' slabs, interleaved; its resolution of
+  // the second owner's inbox crosses the segment link.
+  std::thread([&]{
+    for(size_t i = 0; i < cap; i++)
+    {
+      ponyint_pool_free(0, owners[0].objs[i]);
+      ponyint_pool_free(0, owners[1].objs[i]);
+    }
+
+    ponyint_pool_thread_cleanup();
+  }).join();
+
+  for(int t = 0; t < 2; t++)
+  {
+    owners[t].freed.store(true);
+    owners[t].thread.join();
+  }
+}
+
+// A freeing thread's per-owner chains live in an open-addressing map
+// that doubles when it fills; the doubling rehash must carry every live
+// chain with it. One thread frees to more owners than the initial map
+// admits, forcing a grow with chains in hand, then every owner proves
+// its object came home.
+TEST(PoolArena, ChainMapGrowth)
+{
+  // Past half the initial capacity, where the map doubles mid-stream.
+  static const int owners = (TEST_CHAIN_MAP_INITIAL / 2) + 12;
+
+  std::vector<char*> objs(owners, NULL);
+  std::vector<std::thread> owner_threads(owners);
+  std::vector<std::atomic<int>> stage(owners);
+  std::atomic<bool> freed(false);
+
+  for(int t = 0; t < owners; t++)
+    stage[t].store(0);
+
+  for(int t = 0; t < owners; t++)
+  {
+    owner_threads[t] = std::thread([&, t]{
+      // The first allocation on a fresh thread sits at its slab's base.
+      char* obj = (char*)ponyint_pool_alloc(0);
+      objs[t] = obj;
+      stage[t].store(1);
+
+      while(!freed.load())
+        std::this_thread::yield();
+
+      // The block allocation drains the inbox. The credited object
+      // empties the slab, the slab resets in place, and the next bump
+      // allocation hands the base address out again; an object lost in
+      // the rehash leaves the slab occupied and the addresses differ.
+      void* blk = ponyint_pool_alloc_size(16 * 1024);
+      ponyint_pool_free_size(16 * 1024, blk);
+
+      char* again = (char*)ponyint_pool_alloc(0);
+      ASSERT_EQ(again, obj);
+      ponyint_pool_free(0, again);
+    });
+  }
+
+  for(int t = 0; t < owners; t++)
+  {
+    while(stage[t].load() != 1)
+      std::this_thread::yield();
+  }
+
+  // A fresh thread's chain map is virgin, so the owner count alone
+  // decides when it grows.
+  std::thread([&]{
+    for(int t = 0; t < owners; t++)
+      ponyint_pool_free(0, objs[t]);
+
+    ponyint_pool_thread_cleanup();
+  }).join();
+
+  freed.store(true);
+
+  for(int t = 0; t < owners; t++)
+    owner_threads[t].join();
+}
+
+// A thread takes its owner slot at its first arena, not its first pool
+// call: a thread that only frees owns nothing another thread could
+// address, so it never takes a slot.
+TEST(PoolArena, FreeOnlyThreadTakesNoSlot)
+{
+  // Owned by this thread, so the spawned thread's free is foreign.
+  void* p = ponyint_pool_alloc(0);
+
+  uint32_t before = ponyint_pool_arena_owner_slots_for_test();
+
+  std::thread([&]{
+    ponyint_pool_free(0, p);
+    ponyint_pool_thread_cleanup();
+  }).join();
+
+  ASSERT_EQ(ponyint_pool_arena_owner_slots_for_test(), before);
+
+  std::thread([]{
+    void* q = ponyint_pool_alloc(0);
+    ponyint_pool_free(0, q);
+  }).join();
+
+  ASSERT_EQ(ponyint_pool_arena_owner_slots_for_test(), before + 1);
 }
 
 // One owner's objects spread across several slabs, freed by one foreign

@@ -228,7 +228,7 @@ Two pieces of the arena allocator's design are still to come: the scheduler's su
 
 The arena allocator carries no AddressSanitizer, Valgrind, or pooltrack instrumentation, so combining it with `address_sanitizer`, `valgrind`, or `pooltrack` is rejected at compile time: a clean run that checked nothing misleads. Pair those options with `pool_classic` (or, for AddressSanitizer, `pool_memalign`).
 
-Two sizing limits to know about the arena allocator. A process gets 1,024 distinct allocator-using threads over its lifetime — slots are never reused, and the next thread aborts with a message; the runtime's own threads use a handful. And reserving an arena briefly maps twice the arena size (256 MiB) before trimming, so a process running near an address-space cap needs that much headroom at each arena boundary.
+One sizing limit to know about the arena allocator: reserving an arena briefly maps twice the arena size (256 MiB) before trimming, so a process running near an address-space cap needs that much headroom at each arena boundary.
 
 ### arch
 
