@@ -215,7 +215,7 @@ Several `use=` build options aren't supported on Windows (MSVC). The supported o
 
 ### the runtime allocator, and pool_classic
 
-On Unix platforms the runtime's default allocator is the arena allocator designed in [discussion #5735](https://github.com/ponylang/ponyc/discussions/5735): it gets memory from the operating system in large owned arenas, reuses freed memory across threads and size classes, and returns empty arenas to the operating system. On Windows the default is the classic pool allocator, until the arena allocator's Windows memory-reservation code is written.
+On Unix platforms the runtime's default allocator is the arena allocator designed in [discussion #5735](https://github.com/ponylang/ponyc/discussions/5735): it gets memory from the operating system in large shared regions, carves them into thread-owned arenas, reuses freed memory across threads and size classes, and gives an empty arena's physical pages back to the operating system. On Windows the default is the classic pool allocator, until the arena allocator's Windows memory-reservation code is written.
 
 `use=pool_classic` selects the classic pool on any platform:
 
@@ -228,7 +228,7 @@ Two pieces of the arena allocator's design are still to come: the scheduler's su
 
 The arena allocator carries no AddressSanitizer, Valgrind, or pooltrack instrumentation, so combining it with `address_sanitizer`, `valgrind`, or `pooltrack` is rejected at compile time: a clean run that checked nothing misleads. Pair those options with `pool_classic` (or, for AddressSanitizer, `pool_memalign`).
 
-One sizing limit to know about the arena allocator: memory comes from the operating system in 256 MiB regions whose address space is kept for the life of the process (emptied regions give back their physical pages but stay mapped for reuse), and reserving a region briefly maps twice its size before trimming, so a process running near an address-space cap needs 512 MiB of headroom whenever the allocator opens a new region.
+One sizing limit to know about the arena allocator: memory comes from the operating system in 256 MiB regions (64 MiB on 32-bit platforms) whose address space is kept for the life of the process — emptied regions give back their physical pages but stay mapped for reuse. Reserving a region briefly maps twice its size before trimming, so a process running near an address-space cap needs twice the region size in headroom whenever the allocator opens a new region.
 
 ### arch
 

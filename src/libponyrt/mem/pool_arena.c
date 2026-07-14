@@ -117,8 +117,8 @@ typedef struct pool_item_t
  * life of the process. A thread takes a slot when it reserves its first
  * arena, not when it first touches the allocator: a thread that only
  * frees owns nothing another thread could address, so it needs no slot.
- * An exited thread's slot leaves its inbox slot behind — a cache line in
- * a segment — as the price of never proving reuse safe.
+ * An exited thread's inbox stays behind — a cache line in a segment —
+ * as the price of never proving reuse safe.
  */
 
 #define BATCH_SIZE 32
@@ -164,10 +164,7 @@ static PONY_ATOMIC(uint32_t) next_owner_slot;
 
 /// The inbox for a slot, walking the segment list and appending missing
 /// segments. An append races benignly: the loser frees its segment and
-/// takes the winner's. Only slot assignment ever appends in practice — a
-/// freeing thread resolves a slot it read from an arena header, and the
-/// slot's owner created the segment before stamping any arena — but the
-/// grow branch is correct from any caller.
+/// takes the winner's.
 static inbox_t* inbox_for_slot(uint32_t slot)
 {
   PONY_ATOMIC(inbox_segment_t*)* link = &segments_head;
@@ -313,7 +310,7 @@ typedef struct pool_arena_thread_t
   arena_unit_t* partial_slabs[POOL_COUNT];
   /// Foreign objects not yet handed to their owners: an open-addressing
   /// map keyed by owner slot, grown by doubling. Most threads free to a
-  /// handful of owners; the map stays a page until they don't.
+  /// handful of owners; the map usually stays one page.
   chain_t* chains;
   uint32_t chain_cap;
   uint32_t chain_used;
@@ -604,12 +601,13 @@ static arena_t* region_create()
   return (arena_t*)((char*)region + ARENA_SIZE);
 }
 
-static void arena_release(arena_t* arena);
-
 /// An arena slot for a new arena: the cached region first, then every
-/// listed region, then a fresh region. On reservation failure, gives
-/// back this thread's empty reserve arena — its slot becomes claimable
-/// — and walks the list once more before giving up.
+/// listed region, then a fresh region. When the reservation fails, the
+/// list is walked once more — another thread may have released a slot
+/// or published a region in the window — before giving up. No owned
+/// arena can be given back here: this runs only after slab_reserve
+/// failed in every owned arena, and an empty owned arena satisfies any
+/// legal span, so none exists.
 static arena_t* arena_claim()
 {
   arena_t* arena = NULL;
@@ -632,25 +630,7 @@ static arena_t* arena_claim()
     }
 
     if((arena == NULL) && (attempt == 0))
-    {
       arena = region_create();
-
-      if(arena == NULL)
-      {
-        // The reservation failed. The retry walk needs a free slot, so
-        // give back this thread's empty reserve arena if it holds one.
-        arena_t* empty = this_thread.arenas;
-
-        while((empty != NULL) &&
-          (empty->used_units != arena_header_units()))
-          empty = empty->next;
-
-        if(empty == NULL)
-          break;
-
-        arena_release(empty);
-      }
-    }
   }
 
   if(arena == NULL)
@@ -672,6 +652,15 @@ static arena_t* arena_new()
   arena_t* arena = arena_claim();
 
   ponyint_virt_commit(arena, arena_header_units() << UNIT_BITS);
+
+  // The slot may be a re-claim whose previous owner's pages were
+  // dropped. What a dropped page reads back as is platform behavior,
+  // not a contract, so the whole mutable header starts from zero here
+  // rather than trusting refault content.
+  memset(arena->bitmap, 0, sizeof(arena->bitmap));
+  memset(arena->dirty, 0, sizeof(arena->dirty));
+  memset(arena->units, 0, sizeof(arena->units));
+  arena->dirty_units = 0;
 
   arena->kind = MAPPING_ARENA;
   arena->owner_slot = this_thread.slot;
@@ -822,10 +811,11 @@ static void slab_release(arena_t* arena, arena_unit_t* rec)
 
   if(arena->used_units == arena_header_units())
   {
-    // Keep one completely empty arena per thread in reserve, its pages
-    // dropped but its address space held, so churn across the arena
-    // boundary does not pay a map/unmap cycle each time. A second empty
-    // arena goes back to the operating system.
+    // Keep one completely empty arena per thread in reserve, its payload
+    // pages dropped but its slot and header kept, so churn across the
+    // arena boundary does not pay a release and re-claim each time. A
+    // second empty arena releases its slot back to its region, every
+    // page dropped.
     arena_t* other = this_thread.arenas;
 
     while(other != NULL)
@@ -981,8 +971,8 @@ static chain_t* chain_map_probe(chain_t* map, uint32_t cap, uint32_t owner)
 }
 
 /// Doubles the chain map (or creates it). Runs on the free path when a
-/// thread meets a new owner; ponyint_virt_alloc aborts the process if
-/// the system is too far gone to give it a page.
+/// thread first frees to a new owner; ponyint_virt_alloc aborts the
+/// process if the mapping fails.
 static void chain_map_grow()
 {
   chain_t* old = this_thread.chains;
@@ -1515,9 +1505,8 @@ uint32_t ponyint_pool_arena_owner_slots_for_test()
   return atomic_load_explicit(&next_owner_slot, memory_order_relaxed);
 }
 
-/// Test seam: credits one run exactly as the inbox drain does. The death
-/// tests forge corrupt runs and prove each crediting check refuses them;
-/// a real inbox delivery cannot be timed from a test.
+/// Test seam: credits one run exactly as the inbox drain does; a real
+/// inbox delivery cannot be timed from a test.
 void ponyint_pool_arena_credit_run_for_test(void* run_tail)
 {
   apply_run((run_header_t*)run_tail);

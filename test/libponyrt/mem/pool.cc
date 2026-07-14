@@ -9,6 +9,7 @@
 
 #ifdef PLATFORM_IS_LINUX
 #include <fcntl.h>
+#include <sys/resource.h>
 #include <unistd.h>
 #endif
 
@@ -271,8 +272,8 @@ bool maps_covers(void* p)
 }
 
 // Bytes of the range holding physical pages (or swap), from
-// /proc/self/pagemap. Parked address space stays mapped forever, so
-// mapped-or-not cannot show a release anymore; pages-or-not can.
+// /proc/self/pagemap. Parked address space stays mapped for the life of
+// the process, so mapped-or-not cannot show a release; pages-or-not can.
 size_t resident_bytes(void* p, size_t len)
 {
   int fd = open("/proc/self/pagemap", O_RDONLY);
@@ -913,8 +914,7 @@ TEST(Pool, LiveRecordChurn)
 
 /* The arena backend's own geometry and registry sizing. These constants
  * mirror pool_arena.c (which cannot export them without widening its
- * interface); if a value changes there, these tests change in the same
- * PR.
+ * interface); change both together.
  */
 #ifdef PLATFORM_IS_ILP32
 #define TEST_REGION_SIZE ((size_t)64 * 1024 * 1024)
@@ -927,6 +927,9 @@ TEST(Pool, LiveRecordChurn)
 #define TEST_SWEEP_THRESHOLD ((TEST_ARENA_SIZE / TEST_UNIT_SIZE) / 4)
 #define TEST_SEGMENT_SLOTS 256
 #define TEST_CHAIN_MAP_INITIAL 128
+
+static_assert((TEST_REGION_SIZE / TEST_ARENA_SIZE) == 32,
+  "a region's slot bitmap is one 32-bit word; mirrors pool_arena.c");
 
 /// A block sized so exactly one fits per arena (its span is more than
 /// half the arena's units), on both geometries. One block, one arena.
@@ -1104,7 +1107,7 @@ TEST(PoolArena, ArenaGeometry)
     for(int i = 0; i < 8; i++)
       ASSERT_EQ((uint8_t)recarved[i][0], 0x7e) << "re-carved canary " << i;
 
-    // Arena 1 is a checkerboard: hundreds of free units, no two in a
+    // Arena 1 is a checkerboard: about half its units free, no two in a
     // row. Arena 2 is full. A two-unit span must open a third arena.
     char* span2 = (char*)ponyint_pool_alloc_size(32 * 1024);
     ASSERT_NE(arena_base_of(span2), base1);
@@ -1379,6 +1382,94 @@ TEST(PoolArenaDeath, CreditRunForeignArena)
   }, "owner_slot == this_thread.slot");
 
   ponyint_pool_free(0, p);
+}
+
+// A run whose tail sits in an oversized mapping rather than an arena:
+// the mapping-kind check must refuse it before the header is read as an
+// arena's.
+TEST(PoolArenaDeath, CreditRunOversizedMapping)
+{
+  testing::FLAGS_gtest_death_test_style = "threadsafe";
+
+  EXPECT_DEATH({
+    // Past the arena capacity: an own mapping, payload one unit in.
+    char* p = (char*)ponyint_pool_alloc_size(9 * 1024 * 1024);
+    forged_run_t* h = (forged_run_t*)p;
+    h->next_run = NULL;
+    h->first = p;
+    h->len = 1;
+    ponyint_pool_arena_credit_run_for_test(p);
+  }, "MAPPING_ARENA");
+}
+
+// A run claiming two objects in a block slab, which holds exactly one:
+// the block arm's length check must refuse it.
+TEST(PoolArenaDeath, CreditRunBlockLenNotOne)
+{
+  testing::FLAGS_gtest_death_test_style = "threadsafe";
+
+  EXPECT_DEATH({
+    void* pin = ponyint_pool_alloc(0);
+    char* b = (char*)ponyint_pool_alloc_size(2 * 1024 * 1024);
+    forged_run_t* h = (forged_run_t*)b;
+    h->next_run = NULL;
+    h->first = b;
+    h->len = 2;
+    ponyint_pool_arena_credit_run_for_test(b);
+    (void)pin;
+  }, "len == 1");
+}
+
+// A run whose object is not at its block slab's base: the block arm's
+// base check must refuse the interior pointer.
+TEST(PoolArenaDeath, CreditRunBlockFirstNotBase)
+{
+  testing::FLAGS_gtest_death_test_style = "threadsafe";
+
+  EXPECT_DEATH({
+    void* pin = ponyint_pool_alloc(0);
+    char* b = (char*)ponyint_pool_alloc_size(2 * 1024 * 1024);
+    forged_run_t* h = (forged_run_t*)b;
+    h->next_run = NULL;
+    h->first = b + 64;
+    h->len = 1;
+    ponyint_pool_arena_credit_run_for_test(b);
+    (void)pin;
+  }, "first == ");
+}
+
+// A run whose tail sits off the slab's object grid: the alignment check
+// must refuse it.
+TEST(PoolArenaDeath, CreditRunMisalignedMember)
+{
+  testing::FLAGS_gtest_death_test_style = "threadsafe";
+
+  EXPECT_DEATH({
+    char* obj = (char*)ponyint_pool_alloc(0);
+    forged_run_t* h = (forged_run_t*)(obj + 8);
+    h->next_run = NULL;
+    h->first = obj + 8;
+    h->len = 1;
+    ponyint_pool_arena_credit_run_for_test(obj + 8);
+  }, "size - 1");
+}
+
+// A run whose chain does not end at the tail that carries the header:
+// the walk must refuse the broken chain rather than splice it.
+TEST(PoolArenaDeath, CreditRunBrokenChain)
+{
+  testing::FLAGS_gtest_death_test_style = "threadsafe";
+
+  EXPECT_DEATH({
+    char* a = (char*)ponyint_pool_alloc(0);
+    char* b = (char*)ponyint_pool_alloc(0);
+    *(void**)a = a; // the chain loops back instead of reaching b
+    forged_run_t* h = (forged_run_t*)b;
+    h->next_run = NULL;
+    h->first = a;
+    h->len = 2;
+    ponyint_pool_arena_credit_run_for_test(b);
+  }, "it == last");
 }
 
 // A block freed on another thread goes home through the owner's inbox and
@@ -1708,6 +1799,129 @@ TEST(PoolArena, FreeOnlyThreadTakesNoSlot)
   ASSERT_EQ(ponyint_pool_arena_owner_slots_for_test(), before + 1);
 }
 
+// A slot outlives its thread: a foreign free of an exited owner's
+// object pushes to an inbox nothing will ever drain, and that must be
+// safe — the segment holding it is never freed or moved. The freeing
+// thread takes no slot, and the allocator keeps serving.
+TEST(PoolArena, FreeToExitedOwner)
+{
+  char* obj = NULL;
+
+  std::thread([&]{
+    obj = (char*)ponyint_pool_alloc(0);
+  }).join();
+
+  uint32_t before = ponyint_pool_arena_owner_slots_for_test();
+
+  std::thread([&]{
+    ponyint_pool_free(0, obj);
+    ponyint_pool_thread_cleanup();
+  }).join();
+
+  ASSERT_EQ(ponyint_pool_arena_owner_slots_for_test(), before);
+
+  void* p = ponyint_pool_alloc(0);
+  ASSERT_NE(p, (void*)NULL);
+  ponyint_pool_free(0, p);
+}
+
+// Slot assignment racing across a segment boundary: the append is one
+// compare-and-swap, the losers adopt the winner's segment, and every
+// owner's inbox must end up where a foreign freeing thread's walk finds
+// it. Delivery to all racers proves no owner cached an inbox in a
+// segment the list does not hold.
+TEST(PoolArena, OwnerRegistryAppendRace)
+{
+  static const int racers = 16;
+
+  // Park slot assignment just short of a boundary so the racers cross
+  // it together and contend on the append.
+  uint32_t count = ponyint_pool_arena_owner_slots_for_test();
+  size_t fillers = (TEST_SEGMENT_SLOTS
+    - (count % TEST_SEGMENT_SLOTS) + TEST_SEGMENT_SLOTS - (racers / 2))
+    % TEST_SEGMENT_SLOTS;
+
+  for(size_t i = 0; i < fillers; i++)
+  {
+    std::thread([]{
+      void* p = ponyint_pool_alloc(0);
+      ponyint_pool_free(0, p);
+    }).join();
+  }
+
+  struct Racer
+  {
+    char* obj;
+    std::atomic<int> stage;
+    std::atomic<bool> freed;
+    std::thread thread;
+  };
+
+  std::vector<Racer> r(racers);
+  std::atomic<int> ready(0);
+  std::atomic<bool> go(false);
+
+  for(int i = 0; i < racers; i++)
+  {
+    r[i].obj = NULL;
+    r[i].stage.store(0);
+    r[i].freed.store(false);
+  }
+
+  for(int i = 0; i < racers; i++)
+  {
+    r[i].thread = std::thread([&, i]{
+      ready.fetch_add(1);
+
+      while(!go.load())
+        std::this_thread::yield();
+
+      // Takes a slot; the racers around the boundary contend to append
+      // the segment.
+      r[i].obj = (char*)ponyint_pool_alloc(0);
+      r[i].stage.store(1);
+
+      while(!r[i].freed.load())
+        std::this_thread::yield();
+
+      // The block allocation drains: the credited object empties the
+      // slab, it resets in place, and the base address comes back.
+      void* blk = ponyint_pool_alloc_size(16 * 1024);
+      ponyint_pool_free_size(16 * 1024, blk);
+
+      char* again = (char*)ponyint_pool_alloc(0);
+      EXPECT_EQ(again, r[i].obj);
+      ponyint_pool_free(0, again);
+    });
+  }
+
+  while(ready.load() != racers)
+    std::this_thread::yield();
+
+  go.store(true);
+
+  for(int i = 0; i < racers; i++)
+  {
+    while(r[i].stage.load() != 1)
+      std::this_thread::yield();
+  }
+
+  // One foreign thread frees every racer's object; its inbox resolution
+  // walks the same list the owners populated.
+  std::thread([&]{
+    for(int i = 0; i < racers; i++)
+      ponyint_pool_free(0, r[i].obj);
+
+    ponyint_pool_thread_cleanup();
+  }).join();
+
+  for(int i = 0; i < racers; i++)
+  {
+    r[i].freed.store(true);
+    r[i].thread.join();
+  }
+}
+
 // One owner's objects spread across several slabs, freed by one foreign
 // thread in single batches: the batch sorts into multiple runs, and the
 // owner's drain credits every one of them. Each slab must empty, shown by
@@ -1795,8 +2009,8 @@ TEST(PoolArena, CrossThreadOversizedFree)
 // page — header included — given back, while its address space stays
 // parked in the region. Address equality alone cannot tell the two
 // apart — a released slot is re-carved at the same address — so on
-// Linux the test asks /proc/self/pagemap which pages each arena still
-// holds.
+// Linux the test reads /proc/self/pagemap to see which pages each arena
+// still holds.
 TEST(PoolArena, EmptyArenaReserve)
 {
   on_fresh_thread([]{
@@ -1817,8 +2031,11 @@ TEST(PoolArena, EmptyArenaReserve)
     void* arena2 = (void*)arena_base_of(b2);
 
     // Touched pages are resident before the frees, so the zero counts
-    // below show a return, not a block that never held pages.
-    ASSERT_GT(resident_bytes(b1, big), (size_t)0);
+    // below show a return, not a block that never held pages. The
+    // SIZE_MAX check keeps an unreadable pagemap from passing anything.
+    size_t r1 = resident_bytes(b1, big);
+    ASSERT_NE(r1, (size_t)SIZE_MAX);
+    ASSERT_GT(r1, (size_t)0);
     ASSERT_GT(resident_bytes(b2, big), (size_t)0);
 
     ponyint_pool_free_size(big, b1);
@@ -1929,7 +2146,7 @@ TEST(PoolArena, CrossRegionCarve)
 // Concurrent carving: every claim is one compare-and-swap on a shared
 // region's slot bitmap, and no two threads may ever hold the same
 // arena. All blocks stay live until the distinctness check is done, so
-// a released slot legitimately reused by a racer cannot masquerade as
+// a released slot legitimately reused by a racer is never mistaken for
 // a double claim. Each thread stamps and verifies its blocks, so a
 // slot handed out twice also shows up as a torn stamp.
 TEST(PoolArena, RegionCarveRace)
@@ -1953,18 +2170,25 @@ TEST(PoolArena, RegionCarveRace)
       while(!go.load())
         std::this_thread::yield();
 
+      // EXPECT rather than ASSERT throughout the thread body: an ASSERT
+      // returns early, the done counter never rises, and the test hangs
+      // instead of failing.
       for(int i = 0; i < per_thread; i++)
       {
         char* p = (char*)ponyint_pool_alloc_size(big);
-        ASSERT_NE(p, (char*)NULL);
-        memset(p, 0x50 + t, 256);
-        blocks[t].push_back(p);
+        EXPECT_NE(p, (char*)NULL);
+
+        if(p != NULL)
+        {
+          memset(p, 0x50 + t, 256);
+          blocks[t].push_back(p);
+        }
       }
 
       for(char* p : blocks[t])
       {
-        ASSERT_EQ((uint8_t)p[0], (uint8_t)(0x50 + t));
-        ASSERT_EQ((uint8_t)p[255], (uint8_t)(0x50 + t));
+        EXPECT_EQ((uint8_t)p[0], (uint8_t)(0x50 + t));
+        EXPECT_EQ((uint8_t)p[255], (uint8_t)(0x50 + t));
       }
 
       done.fetch_add(1);
@@ -1986,21 +2210,27 @@ TEST(PoolArena, RegionCarveRace)
   while(done.load() != threads)
     std::this_thread::yield();
 
-  // Every arena claimed exactly once across all threads.
+  // Every arena claimed exactly once across all threads. The release
+  // gate opens before the assertion so a failure still lets every
+  // thread finish and join.
   std::set<uintptr_t> arenas;
+  size_t held = 0;
 
   for(int t = 0; t < threads; t++)
   {
     for(char* p : blocks[t])
       arenas.insert(arena_base_of(p));
-  }
 
-  ASSERT_EQ(arenas.size(), (size_t)(threads * per_thread));
+    held += blocks[t].size();
+  }
 
   checked.store(true);
 
   for(int t = 0; t < threads; t++)
     carvers[t].join();
+
+  ASSERT_EQ(held, (size_t)(threads * per_thread));
+  ASSERT_EQ(arenas.size(), (size_t)(threads * per_thread));
 }
 
 // An emptied region's address space parks on the region list: its pages
@@ -2033,6 +2263,10 @@ TEST(PoolArena, ParkedRegionRecarve)
       ponyint_pool_free_size(big, p);
 
 #ifdef PLATFORM_IS_LINUX
+    // An unreadable pagemap must fail here, not pass the zero-checks.
+    ASSERT_NE(resident_bytes((void*)full, TEST_UNIT_SIZE),
+      (size_t)SIZE_MAX);
+
     size_t parked_seen = 0;
 
     for(size_t s = 1; s <= usable; s++)
@@ -2084,6 +2318,181 @@ TEST(PoolArena, ParkedRegionRecarve)
 
     ponyint_pool_free(0, pin);
   });
+}
+
+// Parked slots live in regions behind the list head, and only the walk
+// across region links reaches them. Fill one fresh region, then a
+// second so the first sits behind the head; a slot released in the
+// first must come back through the walk.
+TEST(PoolArena, RegionListWalkReclaims)
+{
+  on_fresh_thread([]{
+    static const size_t big = TEST_ARENA_FILLING_BLOCK;
+
+    void* pin = ponyint_pool_alloc(0);
+
+    std::vector<char*> blocks;
+    std::map<uintptr_t, char*> by_arena_a;
+    uintptr_t region_a = fill_whole_region(blocks, by_arena_a);
+    ASSERT_NE(region_a, (uintptr_t)0) << "no region filled within bound";
+
+    std::map<uintptr_t, char*> by_arena_b;
+    uintptr_t region_b = fill_whole_region(blocks, by_arena_b);
+    ASSERT_NE(region_b, (uintptr_t)0) << "no second region within bound";
+    ASSERT_NE(region_b, region_a);
+
+    // Two of region A's arenas, neither shared with the pin: the first
+    // freed becomes the kept reserve, the second releases its slot.
+    uintptr_t pinned = arena_base_of(pin);
+    char* p1 = NULL;
+    char* p2 = NULL;
+
+    for(std::pair<const uintptr_t, char*>& e : by_arena_a)
+    {
+      if(e.first == pinned)
+        continue;
+
+      if(p1 == NULL)
+        p1 = e.second;
+      else if(p2 == NULL)
+      {
+        p2 = e.second;
+        break;
+      }
+    }
+
+    ASSERT_NE(p2, (char*)NULL);
+    ponyint_pool_free_size(big, p1);
+    ponyint_pool_free_size(big, p2);
+
+    // The kept reserve is the only owned space, so it serves first,
+    // straight back at the first block's address.
+    char* r1 = (char*)ponyint_pool_alloc_size(big);
+    ASSERT_EQ(r1, p1);
+
+    // The released slot sits in region A, behind region B on the list.
+    // Leftover slots in regions between them may serve first, so soak
+    // within a bound; the claim that lands at p2 walked the links past
+    // the full head region.
+    std::vector<char*> soak;
+    char* found = NULL;
+
+    for(int i = 0; (i < 128) && (found == NULL); i++)
+    {
+      char* q = (char*)ponyint_pool_alloc_size(big);
+
+      if(q == p2)
+        found = q;
+      else
+        soak.push_back(q);
+    }
+
+    ASSERT_EQ(found, p2);
+
+    ponyint_pool_free_size(big, found);
+    ponyint_pool_free_size(big, r1);
+
+    for(char* q : soak)
+      ponyint_pool_free_size(big, q);
+
+    for(char* p : blocks)
+    {
+      if((p != p1) && (p != p2))
+        ponyint_pool_free_size(big, p);
+    }
+
+    ponyint_pool_free(0, pin);
+  });
+}
+
+// The lock-free protocols under real contention. The single-purpose
+// tests above separate their phases, so a producer never flushes while
+// its owner drains, no inbox ever has two producers at once, and no
+// thread carves while another releases. This churn overlaps all three,
+// with content canaries on every handoff; it is also what puts those
+// interleavings in front of the thread sanitizer.
+TEST(PoolArena, ConcurrentChurnStress)
+{
+  static const int nthreads = 4;
+  static const int rounds = 200;
+  static const size_t big = TEST_ARENA_FILLING_BLOCK;
+
+  std::atomic<char*> mailbox[nthreads][nthreads]; // [to][from]
+  std::atomic<int> received(0);
+  std::atomic<int> senders_done(0);
+
+  for(int i = 0; i < nthreads; i++)
+  {
+    for(int j = 0; j < nthreads; j++)
+      mailbox[i][j].store(NULL);
+  }
+
+  auto drain_row = [&](int me)
+  {
+    for(int j = 0; j < nthreads; j++)
+    {
+      if(j == me)
+        continue;
+
+      char* got = mailbox[me][j].exchange(NULL);
+
+      if(got != NULL)
+      {
+        EXPECT_EQ((uint8_t)got[0], (uint8_t)got[63]);
+        EXPECT_NE((uint8_t)got[0] & 0x80, 0);
+        ponyint_pool_free_size(big, got);
+        received.fetch_add(1);
+      }
+    }
+  };
+
+  std::vector<std::thread> workers(nthreads);
+
+  for(int i = 0; i < nthreads; i++)
+  {
+    workers[i] = std::thread([&, i]{
+      for(int r = 0; r < rounds; r++)
+      {
+        // Every block allocation drains this thread's inbox, so blocks
+        // credited by the frees below come home mid-churn and their
+        // arenas release while other threads are carving.
+        char* b = (char*)ponyint_pool_alloc_size(big);
+        memset(b, 0x80 | ((i * 31 + r) & 0x3F), 64);
+
+        int to = (i + 1 + (r % (nthreads - 1))) % nthreads;
+        char* expected = NULL;
+
+        while(!mailbox[to][i].compare_exchange_weak(expected, b))
+        {
+          expected = NULL;
+          drain_row(i); // keep consuming so the ring cannot deadlock
+          std::this_thread::yield();
+        }
+
+        drain_row(i);
+      }
+
+      senders_done.fetch_add(1);
+
+      // Every put precedes its sender's counter bump, so one sweep
+      // after the counter tops out cannot miss a block.
+      while(senders_done.load() != nthreads)
+      {
+        drain_row(i);
+        std::this_thread::yield();
+      }
+
+      drain_row(i);
+      ponyint_pool_thread_cleanup();
+    });
+  }
+
+  for(int i = 0; i < nthreads; i++)
+    workers[i].join();
+
+  // Conservation: every block sent was received, verified, and freed
+  // exactly once.
+  ASSERT_EQ(received.load(), nthreads * rounds);
 }
 
 // The block-or-own-mapping decision sits where a block no longer fits in
@@ -2231,5 +2640,41 @@ TEST(PoolArenaDeath, OversizedRequestOverflow)
     ponyint_pool_alloc_size(SIZE_MAX);
   }, "tried to reserve");
 }
+
+#ifdef PLATFORM_IS_LINUX
+// When no region has a free slot and the operating system refuses a new
+// reservation, the allocator must stop loudly, not return garbage. The
+// death statement runs in a re-executed child with a fresh allocator,
+// so capping the address space below one region reservation makes the
+// first allocation abort.
+TEST(PoolArenaDeath, RegionReservationExhaustion)
+{
+  testing::FLAGS_gtest_death_test_style = "threadsafe";
+
+  EXPECT_DEATH({
+    size_t vm_kb = 0;
+    FILE* f = fopen("/proc/self/status", "r");
+    char line[256];
+
+    while(fgets(line, sizeof(line), f) != NULL)
+    {
+      if(sscanf(line, "VmSize: %zu kB", &vm_kb) == 1)
+        break;
+    }
+
+    fclose(f);
+
+    // Reserving a region transiently maps twice its size; 300 MiB of
+    // headroom is under that on both geometries.
+    struct rlimit rl;
+    rl.rlim_cur = (vm_kb * 1024) + (300 * 1024 * 1024);
+    rl.rlim_max = rl.rlim_cur;
+    setrlimit(RLIMIT_AS, &rl);
+
+    for(int i = 0; i < 4096; i++)
+      ponyint_pool_alloc_size(TEST_ARENA_FILLING_BLOCK);
+  }, "tried to reserve");
+}
+#endif
 
 #endif
