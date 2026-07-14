@@ -1813,6 +1813,7 @@ TEST(PoolArena, SuspendFlushWakes)
   std::atomic<int> stage(0);
   std::atomic<bool> done(false);
   char* objs[3] = {NULL, NULL, NULL};
+  char* fresh = NULL;
 
   std::thread owner([&]{
     ponyint_pool_set_waker([](void* arg){
@@ -1836,12 +1837,19 @@ TEST(PoolArena, SuspendFlushWakes)
     while(stage.load() != 3)
       std::this_thread::yield();
 
-    // Clear the mark: deliveries stop waking.
+    // Clear the mark, and allocate a live object for the last
+    // delivery: everything in objs has been credited back by now, and
+    // freeing an already-credited address again would corrupt.
     ponyint_pool_drain();
+    fresh = (char*)ponyint_pool_alloc(0);
     stage.store(4);
 
     while(stage.load() != 5)
       std::this_thread::yield();
+
+    // Retires the waker and drains the last delivery, so the exiting
+    // thread's inbox holds nothing.
+    ponyint_pool_thread_cleanup();
   });
 
   while(stage.load() != 1)
@@ -1852,6 +1860,7 @@ TEST(PoolArena, SuspendFlushWakes)
   std::thread([&]{
     ponyint_pool_free(0, objs[0]);
     ponyint_pool_suspend_flush(); // the flush half: delivers the chain
+    ponyint_pool_thread_cleanup();
   }).join();
 
   ASSERT_EQ(wakes.load(), 1);
@@ -1882,10 +1891,10 @@ TEST(PoolArena, SuspendFlushWakes)
   while(stage.load() != 4)
     std::this_thread::yield();
 
-  // Mark cleared: a delivery must not wake. Reuse an address the owner
-  // got back so there is something to free.
+  // Mark cleared: a delivery must not wake. The owner allocated fresh
+  // above so there is a live object to free.
   std::thread([&]{
-    ponyint_pool_free(0, objs[0]);
+    ponyint_pool_free(0, fresh);
     ponyint_pool_thread_cleanup();
   }).join();
 
@@ -1902,7 +1911,7 @@ extern "C" void ponyint_pool_arena_suspend_flush_hook_for_test(
 
 // The one interleaving the flush's re-check exists for: a delivery
 // that lands after the flush's drain but before its mark. The producer
-// sees no mark, so it does not wake; only the re-check can notice the
+// sees no mark, so it does not wake; only the re-check finds the
 // mail. The window is a few instructions wide, so the test holds the
 // flush open in it with the test hook and delivers deterministically.
 TEST(PoolArena, SuspendFlushRecheckWindow)
@@ -1937,7 +1946,7 @@ TEST(PoolArena, SuspendFlushRecheckWindow)
 
     // The flush must have consumed the in-window mail itself: the
     // producer saw no mark, so no wake fired, and returning marked
-    // with a non-empty inbox would be the stranding.
+    // with a non-empty inbox would strand the mail.
     ASSERT_TRUE(ponyint_pool_arena_inbox_empty_for_test());
     ASSERT_EQ(wakes.load(), 0);
 
@@ -2061,6 +2070,44 @@ TEST(PoolArena, NullWakerDeliverySilent)
 
   stage.store(2);
   owner.join();
+}
+
+// A waker registered after the thread's slot already exists applies
+// immediately, not through the pre-slot stash: the runtime's main
+// thread registers after it has long been allocating.
+TEST(PoolArena, WakerRegisteredAfterSlot)
+{
+  static std::atomic<int> wakes(0);
+
+  std::atomic<int> stage(0);
+  char* obj = NULL;
+
+  std::thread owner([&]{
+    obj = (char*)ponyint_pool_alloc(0); // slot exists first
+    ponyint_pool_set_waker([](void*){ wakes.fetch_add(1); }, NULL);
+    ponyint_pool_suspend_flush();
+    stage.store(1);
+
+    while(stage.load() != 2)
+      std::this_thread::yield();
+
+    ponyint_pool_drain();
+    ponyint_pool_set_waker(NULL, NULL);
+  });
+
+  while(stage.load() != 1)
+    std::this_thread::yield();
+
+  std::thread([&]{
+    ponyint_pool_free(0, obj);
+    ponyint_pool_thread_cleanup();
+  }).join();
+
+  ASSERT_EQ(wakes.load(), 1);
+
+  stage.store(2);
+  owner.join();
+  wakes.store(0);
 }
 
 // A slot outlives its thread: a foreign free of an exited owner's
@@ -2765,8 +2812,9 @@ TEST(PoolArena, ConcurrentChurnStress)
 // Which side a probe took is read from what its free does — an own
 // mapping is returned to the operating system, an in-arena block's
 // region stays parked — because that is the contract, and it holds
-// whatever the geometry is. Classifying by pointer offset instead
-// broke when the header size changed.
+// whatever the geometry is. The classification reads /proc, so it
+// runs on Linux only; elsewhere the ladder still proves both sides
+// usable edge to edge.
 TEST(PoolArena, BlockOversizedBoundary)
 {
   on_fresh_thread([]{

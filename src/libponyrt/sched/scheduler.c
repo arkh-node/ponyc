@@ -272,10 +272,11 @@ static void send_msg_all(uint32_t from, sched_msg_t msg, intptr_t arg)
     send_msg(from, i, msg, arg);
 }
 
-/// Why a scheduler-family thread is being woken. WORK accompanies a
-/// count raise the caller has already made; DRAIN touches nothing but
-/// the drain flag, so a suspended thread empties its allocator inbox
-/// and sleeps on; SHUTDOWN is the terminal fan-out.
+/// Why a scheduler or pinned-actor thread is being woken. WORK
+/// accompanies a count raise the caller has already made; DRAIN
+/// touches nothing but the drain flag, so a suspended thread empties
+/// its allocator inbox and sleeps on; SHUTDOWN is the terminal
+/// fan-out.
 typedef enum
 {
   SCHED_WAKE_WORK,
@@ -292,9 +293,9 @@ typedef enum
 static __pony_thread_local bool sched_mut_held;
 #endif
 
-/// Every wake of a scheduler-family thread goes through here: one home
-/// for signal delivery, the pthreads lost-signal protocol, and the
-/// systematic-testing arms.
+/// Every wake of a scheduler or pinned-actor thread goes through
+/// here: one home for signal delivery, the pthreads lost-signal
+/// protocol, and the systematic-testing arms.
 static void sched_wake(scheduler_t* sched, sched_wake_reason_t reason)
 {
   if(reason == SCHED_WAKE_DRAIN)
@@ -335,9 +336,9 @@ static void sched_wake(scheduler_t* sched, sched_wake_reason_t reason)
 #endif
 }
 
-/// The trampoline the allocator's delivery path enters with: the
-/// include direction runs sched -> mem, so the allocator holds this by
-/// pointer.
+/// The waker scheduler threads register with the allocator: a
+/// delivery into a suspended thread's inbox calls it to request a
+/// drain wake.
 static void sched_drain_waker(void* arg)
 {
   sched_wake((scheduler_t*)arg, SCHED_WAKE_DRAIN);
@@ -1006,8 +1007,9 @@ static pony_actor_t* perhaps_suspend_scheduler(
 #endif
 
       // This thread is running again — whether suspension ended, was
-      // refused inside suspend_scheduler, or the inner gate said no.
-      // Unmark and reclaim anything delivered in the window.
+      // refused inside suspend_scheduler, or the scheduler-0/noisy
+      // check refused it. Unmark and reclaim anything delivered in
+      // the window.
       ponyint_pool_drain();
 
       if(actor != NULL)

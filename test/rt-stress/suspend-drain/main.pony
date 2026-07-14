@@ -8,37 +8,35 @@ waking any of them into scheduling work.
 
 Phases:
 
-1. Allocate: N actors, spread across all scheduler threads, each build
-   `--blocks` byte arrays of `--block-size` (defaults sized so every block
-   is an immediate-decommit span in the arena allocator) and send them to
-   one collector.
-2. Scale down: the allocators go idle; every scheduler but one suspends.
-   The collector, the only busy actor, polls `pony_active_schedulers`
-   until the count reaches `--min-schedulers`.
-3. Drain: the collector drops every block and asks each allocator to run
-   its garbage collection. The allocators now run on the one active
-   scheduler, freeing memory whose owning threads are suspended: the
-   frees are delivered to the suspended owners, whose drain wakes must
-   reclaim the memory without scheduling work. The collector polls
+1. Allocate: N actors, spread across all scheduler threads, each
+   allocate `--blocks` raw pool blocks of `--block-size` bytes (the
+   default is an immediate-decommit span in the arena allocator, so its
+   return is deterministic) and hand the pointers to one collector.
+2. Scale down: the allocators go idle; the schedulers scale down. The
+   collector polls `pony_active_schedulers` until the count reaches
+   `--min-schedulers`.
+3. Drain: the collector frees every raw block from its own thread —
+   all of them foreign, owned by the suspended threads the allocators
+   ran on. No actor work is involved, so with the quiescence probes
+   held off by the collector's own busy polling, the owners' drain
+   wakes are the only path that can reclaim. The collector polls
    resident memory (VmRSS) until at least `--reclaim-fraction` of the
-   payload has returned, asserting on every poll that the active
-   scheduler count never rose: draining must not fake activity.
+   payload has returned and the active count has held at the floor for
+   a run of polls; a rise that persists with no work to run means a
+   drain wake raised the active scheduler count, which it must not.
 4. Scale up: fresh work is spawned; the count must rise above the
    minimum, proving the suspended threads still activate after their
    drain episodes.
 
 Exit code 0 with a report on success; 1 with the failed phase on failure.
-Run with --ponyminthreads 1 (and optionally --ponymaxthreads) so phase 2
-has a floor to reach; pass the same value as --min-schedulers.
+Run with --ponyminthreads 1 so phase 2 has a floor to reach, and
+--min-schedulers 2: polling rides a timer, and a pending timer keeps a
+second scheduler active, so a floor of 1 is never reached.
 """
 use "cli"
-use "collections"
-use "files"
 use "time"
 
 use @pony_active_schedulers[U32]()
-use @pony_ctx[Pointer[None]]()
-use @pony_triggergc[None](ctx: Pointer[None])
 use @ponyint_pool_alloc_size[Pointer[U8]](size: USize)
 use @ponyint_pool_free_size[None](size: USize, p: USize)
 use @memset[Pointer[None]](p: Pointer[U8] tag, c: I32, n: USize)
@@ -79,7 +77,8 @@ actor Collector
   var _polls: USize = 0
   var _rss_before_kb: USize = 0
   var _phase: USize = 1
-  var _settled: USize = 0
+  var _high_ms: U64 = 0
+  var _settled_ms: U64 = 0
   var _released: Bool = false
   let _timers: Timers = Timers
 
@@ -141,8 +140,7 @@ actor Collector
     wake every suspended thread and would drain their inboxes as a side
     effect — cannot fire, and with one runnable actor there is no work
     to wake anyone for. The only path that reclaims a suspended
-    owner's memory is its drain wake: exactly what the phase asserts,
-    which is why the active count may never rise here.
+    owner's memory is its drain wake: exactly what the phase asserts.
     """
     if _phase != 3 then
       return
@@ -199,23 +197,29 @@ actor Collector
       return
     end
 
-    """
-    The frees went to suspended owners; their drain wakes bring the
-    resident memory back. The release-and-collect step is real actor
-    work and may legitimately wake schedulers, so the assertion is the
-    settled state: the payload reclaimed, the count back at the floor,
-    and holding there for a full second of polls — a drain wake that
-    faked activity would keep the count raised with no work to run.
-    """
+    // The frees went to suspended owners; their drain wakes bring the
+    // resident memory back. The runtime still has legitimate reasons
+    // to wake a scheduler briefly even here — the cycle detector's
+    // periodic prod makes an actor runnable — so a single raised
+    // sample proves nothing. Persistence does: a woken scheduler with
+    // no work re-suspends, so a count that stays raised means a drain
+    // wake raised it and nothing brings it back down. The assertion is
+    // the settled state: the payload reclaimed and the count holding
+    // at the floor for a full second of polls.
+    let now = Time.millis()
     let active = @pony_active_schedulers()
 
-    // One runnable actor, no quiescence probes: nothing can
-    // legitimately wake a scheduler here, so a rise is a drain wake
-    // faking activity.
     if active > _min_schedulers then
-      _fail("phase 3: active schedulers rose to " + active.string() +
-        " with one runnable actor; a drain wake must not fake activity")
-      return
+      if _high_ms == 0 then
+        _high_ms = now
+      elseif (now - _high_ms) > 2_000 then
+        _fail("phase 3: active schedulers held at " + active.string() +
+          " for 2s with one runnable actor; a drain wake must never " +
+          "raise the count")
+        return
+      end
+    else
+      _high_ms = 0
     end
 
     let rss_now = _read_rss_kb()
@@ -225,28 +229,40 @@ actor Collector
     let needed_kb =
       ((_payload_bytes.f64() * _reclaim_fraction) / 1024).usize()
 
-    if reclaimed_kb >= needed_kb then
-      _env.out.print("phase 3: reclaimed " + reclaimed_kb.string() +
-        " KiB from suspended owners (needed " + needed_kb.string() +
-        "), schedulers held at " + active.string())
-      _polls = 0
-      _scale_up()
-    else
-      _polls = _polls + 1
-
-      if (_polls % 2_000) == 0 then
-        _env.out.print("phase 3 poll " + _polls.string() + ": rss " +
-          rss_now.string() + " KiB (baseline " +
-          _rss_before_kb.string() + "), active " + active.string())
+    if (reclaimed_kb >= needed_kb) and (active <= _min_schedulers) then
+      if _settled_ms == 0 then
+        _settled_ms = now
+      elseif (now - _settled_ms) > 1_000 then
+        _env.out.print("phase 3: reclaimed " + reclaimed_kb.string() +
+          " KiB from suspended owners (needed " + needed_kb.string() +
+          "), schedulers held at " + active.string())
+        _polls = 0
+        _scale_up()
+        return
       end
+    else
+      _settled_ms = 0
+    end
 
-      if _polls > 20_000 then
+    _polls = _polls + 1
+
+    if (_polls % 2_000) == 0 then
+      _env.out.print("phase 3 poll " + _polls.string() + ": rss " +
+        rss_now.string() + " KiB (baseline " +
+        _rss_before_kb.string() + "), active " + active.string())
+    end
+
+    if _polls > 20_000 then
+      if reclaimed_kb >= needed_kb then
+        _fail("phase 3: reclaimed, but the scheduler count never held " +
+          "at the floor for a full second")
+      else
         _fail("phase 3: only " + reclaimed_kb.string() + " of " +
           needed_kb.string() +
           " KiB reclaimed while the owners stayed suspended")
-      else
-        poll_busy()
       end
+    else
+      poll_busy()
     end
 
   fun ref _scale_up() =>
@@ -257,7 +273,7 @@ actor Collector
     var i: USize = 0
 
     while i < 32 do
-      Spinner(this)
+      Spinner
       i = i + 1
     end
 
@@ -340,7 +356,7 @@ actor Spinner
   """
   var _n: U64 = 0
 
-  new create(collector: Collector) =>
+  new create() =>
     spin(2_000)
 
   be spin(rounds: U64) =>

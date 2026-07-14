@@ -4,7 +4,7 @@ The runtime's pool allocator couldn't return freed memory to the operating syste
 
 The Unix platforms now use a new allocator in which every piece of memory has an owning thread, following the design in [discussion #5735](https://github.com/ponylang/ponyc/discussions/5735). Memory comes from the operating system in large shared regions that threads carve into arenas; freed memory is reused across threads and size classes, and an emptied arena's physical memory goes back to the operating system while its address space is kept for reuse. Windows keeps the previous allocator until the new one's Windows support arrives.
 
-One of the design's pieces — the scheduler's suspend-and-drain integration — is still to come, and two costs are known: memory freed for a thread that stops allocating is reclaimed only when that thread next allocates past its cache, and a message-passing microbenchmark runs at roughly 85% of the previous allocator's throughput.
+Freed memory reaches its owning thread even when that thread's scheduler is suspended: the delivery wakes the sleeping thread just far enough to reclaim, without scheduling it any work. One cost is known: a message-passing microbenchmark runs at roughly 85% of the previous allocator's throughput.
 
 The previous allocator stays available behind a new build option:
 

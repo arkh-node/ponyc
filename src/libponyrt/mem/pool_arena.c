@@ -569,7 +569,7 @@ static void owner_slot_init()
   this_thread.inbox = inbox_for_slot(slot);
   this_thread.slot = slot;
 
-  // A waker registered before the slot existed applies now. Plain-order
+  // A waker registered before the slot existed applies now. Relaxed
   // stores: no producer reads them until this thread first declares
   // itself asleep, and that seq_cst store orders these before it.
   if(this_thread.waker != NULL)
@@ -1687,8 +1687,7 @@ void ponyint_pool_arena_credit_run_for_test(void* run_tail)
   apply_run((run_header_t*)run_tail);
 }
 
-/// Test seam: whether the caller's inbox is empty. The suspend-drain
-/// tests use it to tell mail consumed by a flush from mail stranded.
+/// Test seam: whether the caller's inbox is empty.
 bool ponyint_pool_arena_inbox_empty_for_test()
 {
   if(this_thread.slot == NO_OWNER_SLOT)
