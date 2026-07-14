@@ -788,7 +788,7 @@ TEST(Pool, FreedMemoryIsReused)
 // non-overlap, and content survival on every operation.
 TEST(Pool, LiveRecordChurn)
 {
-  uint64_t rng = 0x9a808869;
+  uint64_t rng = 0x5eed;
 
   LiveTracker t;
 
