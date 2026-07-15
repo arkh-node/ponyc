@@ -29,8 +29,10 @@ this pipe." The per-platform exit mechanism:
   exits, registered with epoll as a normal read event. No runtime C change.
 - **macOS / BSD**: kqueue `EVFILT_PROC` + `NOTE_EXIT`, keyed on the pid. Needs
   a runtime C change (already written, see below).
-- **Windows**: no native event yet. An interim timer poll of `wait()`
-  (GetExitCodeProcess) stands in. See the Windows section.
+- **Windows**: the child's process handle registered with the `sock_notify`
+  IOCP backend via `RegisterWaitForSingleObject`; the exit arrives as an asio
+  event. The child's pipe reads move onto the same backend. See the Windows
+  section. (An earlier interim timer poll was replaced by this native event.)
 
 Construction is now a `StartProcess` factory returning `(ProcessMonitor |
 ProcessError)` — all fallible setup happens before the actor exists.
@@ -39,8 +41,8 @@ ProcessError)` — all fallible setup happens before the actor exists.
 
 Pony (`packages/process/`):
 - `process_monitor.pony` — the `StartProcess` factory, the three-state actor
-  (`_Running`/`_Disposing`/`_Reaped`), the reap edge and drain, the exit-event
-  routing, and the Windows interim timer.
+  (`_Running`/`_Disposing`/`_Reaped`), the reap edge and drain, and the
+  exit-event routing.
 - `_process.pony` — the `_Process` interface (`kill`/`wait`/`arm_exit_event`/
   `close_exit_source`), `_ProcessPosix` (pidfd on Linux, pid for kqueue),
   `_ProcessWindows`, `_WaitPidStatus`.
@@ -174,59 +176,54 @@ any hardcoded `/bin/...` path exists on your platform.
 
 ## Windows
 
-Windows is the least-finished platform and needs the most judgment.
+The native exit event is implemented; it needs a real Windows build+test run.
 
-### Current state: interim timer poll
+### Current state: native exit event
 
-`_ProcessWindows.arm_exit_event` returns `AsioEvent.none()` and
-`close_exit_source` is a no-op. Instead, `ProcessMonitor._create` starts a
-10ms repeating timer (`_start_windows_poll` / `_windows_poll` in
-`process_monitor.pony`) that, while running, does the pipe reads
-(`_pending_writes`, `_read_pipe` on stdout/stderr/err) and calls
-`_reap_if_exited()`. `wait()` on Windows is `GetExitCodeProcess` via
-`ponyint_win_process_wait`. Because exit is now read from `wait()` and not from
-the pipes, this interim fixes the Windows pipe-close bugs too — it just doesn't
-eliminate the poll the way the design intends.
+`_ProcessWindows.arm_exit_event` creates an asio event carrying the child's
+process handle (in the event's `nsec` slot, since the handle is 64-bit and the
+event's `fd` is `int`). On the asio thread the `sock_notify` IOCP backend
+registers a wait on that handle with `RegisterWaitForSingleObject`; when the
+child exits, a thread-pool callback posts a `KEY_PROC` completion packet and the
+dispatch loop delivers an `ASIO_READ` to the monitor, the same shape as the
+Linux pidfd. The child's pipe reads and stdin write-retries moved onto the same
+backend (Windows pipes carry no readiness signal, so the backend peeks them each
+wait cycle), so the per-child poll timer is gone. `wait()` is
+`GetExitCodeProcess` via `ponyint_win_process_wait`, which no longer closes the
+handle — the backend closes it once, after it unregisters the wait
+(`close_exit_source` → the backend's `ASIO_PROC` unsubscribe).
 
-The timer is disposed on every terminal path (`_close_all` →
-`_dispose_windows_poll`) and is not started if the construction probe already
-reaped the child.
+New runtime C: `src/libponyrt/asio/sock_notify.c` (the `ASIO_PROC`/`ASIO_PIPE`
+handling, the owned-event list, the `RegisterWaitForSingleObject` wait, the
+`KEY_PROC` dispatch), `asio.h` (`ASIO_PIPE = 1 << 6`), `event.h`/`event.c` (the
+Windows-only `proc_wait` HANDLE and `next` link fields), and `lang/process.c`
+(`ponyint_win_process_wait` returns a fixed `-1` error sentinel and no longer
+closes the handle).
 
-### The design's goal (section D): a native exit event
+This code was reviewed for handle/wait/event lifecycle and for the thread-pool-
+callback-vs-unsubscribe race; both came back clean (no leak, double-free,
+use-after-free, dropped or doubled exit). The exit is always re-confirmed
+against the OS on the actor side (`_child.wait()` behind the `_Reaped` gate), so
+the C-side packet matching only needs to be memory-safe, which it is. It has not
+been run on Windows — that is what remains.
 
-Move Windows exit detection onto a `RegisterWaitForSingleObject` bridge in the
-`sock_notify` IOCP backend (`src/libponyrt/asio/sock_notify.c`), and move the
-pipe reads onto asio too, so the poll timer goes away entirely.
+### The earlier sentinel bug (fixed)
 
-The pattern to follow already exists for console stdin: `arm_stdin` (line
-~162) calls `RegisterWaitForSingleObject(..., stdin_notify_cb, ...)`;
-`stdin_notify_cb` posts a `KEY_STDIN` completion packet; the dispatch loop
-turns that into an `ASIO_READ`. An exit event would `RegisterWaitForSingleObject`
-on the process **handle** (the comment at sock_notify.c ~148-149 confirms
-"processes" are valid wait objects), post a new `KEY_PROC` packet, and deliver
-an exit event to the monitor.
+`ponyint_win_process_wait` used to return `GetLastError()` on a wait failure,
+which could be `1` — the same value as its "still running" result — and stall
+the reap. It now returns a fixed `-1` sentinel that the two cases can never
+share.
 
-**The obstacle** (why this wasn't written blind): the process handle is 64-bit,
-but `asio_event_t.fd` is `int` (`src/libponyrt/asio/event.h:20`), so the handle
-can't ride in `ev->fd`. It needs a Windows-only path — likely a Windows-only
-`HANDLE` field on `asio_event_t` (precedent: the existing Windows-only
-`HANDLE timer` field there) plus a dedicated create/subscribe path. This
-touches the shared IOCP backend that all Windows networking depends on, so it
-needs real Windows build+test, not a blind write.
+### Two review notes (Low, non-blocking)
 
-Decision to make (parked for Sean): keep the interim poll for now, or implement
-the native event in this PR. The interim works and fixes the bugs; the native
-event is the design's end state.
-
-### Suspected pre-existing bug to check
-
-`ponyint_win_process_wait` (`src/libponyrt/lang/process.c` ~132-160) returns
-`GetLastError()` on `WAIT_FAILED`. If that error is `1` (ERROR_INVALID_FUNCTION),
-`_ProcessWindows.wait` reads `1` — which is also its "still running" sentinel —
-and the interim timer would then re-poll a closed handle forever. This is
-pre-existing, but the interim timer drives that function repeatedly, so it may
-now be reachable. Worth confirming under Windows and fixing with a distinct
-still-running sentinel if it bites.
+- The comment in `sock_notify.c` (~485-490) oversells the IOCP-FIFO ordering
+  argument; the real backstop is the `wait()`-gated, `_Reaped`-gated reap, which
+  the adjacent defense-in-depth sentence already states. Comment nuance only.
+- If `pony_asio_event_create` ever returned NULL in `arm_exit_event`, the
+  process handle would leak (the Linux path closes its fd unconditionally; the
+  Windows path delegates the close to the backend). Effectively unreachable
+  (`pony_asio_event_create` only returns NULL for bad flags / a missing msg_id,
+  and the monitor always has one).
 
 ### What to verify on Windows
 
@@ -234,14 +231,14 @@ still-running sentinel if it bites.
 - The cross-platform process tests pass: STDIN-STDOUT, STDERR, Expect,
   WritevOrdering, PrintvOrdering, Chdir, BadChdir, BadExec, STDIN-WriteBuf,
   long-running-child, kill-long-running-child, wait-on-closed-process-twice,
-  and the seam tests.
-- No hang, no spin. Watch CPU: the interim poll is a 10ms timer, so idle CPU
-  should be near zero once the child exits and the monitor is reaped.
-- The posix-only tests short-circuit to pass on Windows; that is expected. If
-  you want real Windows coverage of the grandchild/stdin-open cases, write
-  Windows analogs (cmd-based) that keep the same time-discrimination
-  discipline — e.g. a child that backgrounds a long-lived process inheriting
-  its stdout and exits, with a timeout well under the background process's life.
+  and the seam tests. Two Windows-specific tests were added
+  (`windows-empty-environment`, `windows-grandchild-does-not-block-exit`).
+- No hang, no spin. There is no per-child poll timer anymore, so idle CPU
+  should be near zero.
+- The posix-only tests short-circuit to pass on Windows; that is expected.
+  `windows-grandchild-does-not-block-exit` is the Windows analog of the #5764
+  grandchild case; keep the time-discrimination discipline (timeout well under
+  the background process's life) for any further exit-detection tests.
 
 ### Windows test-command reference (already in `_test.pony`)
 
@@ -251,7 +248,11 @@ still-running sentinel if it bites.
 
 ## Reporting back
 
-For each platform: whether it builds, which tests pass/fail (with output),
-whether anything hangs or spins, and — for Windows — the decision on interim
-vs. native and whether the `ponyint_win_process_wait` sentinel bug is real.
-Keep the time-discrimination discipline for any new exit-detection test.
+For each platform: whether it builds, which tests pass/fail (with output), and
+whether anything hangs or spins. Keep the time-discrimination discipline for any
+new exit-detection test.
+
+Status so far: Linux and FreeBSD (15.1) both pass all 28 process tests at the
+current tip, re-verified after the Windows native-event commits. macOS runs the
+same kqueue `EVFILT_PROC` code as FreeBSD, so it is expected to pass; a real run
+is the remaining confirmation. Windows needs its first real build+test run.
