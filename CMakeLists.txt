@@ -622,7 +622,10 @@ else()
 endif()
 
 if(${CMAKE_HOST_SYSTEM_NAME} MATCHES "Darwin")
-    set(CMAKE_C_FLAGS "${CMAKE_C_FLAGS} -DUSE_SCHEDULER_SCALING_PTHREADS")
+    # Both languages, not CMAKE_C_FLAGS: the macro sizes a scheduler_t
+    # field, and the C++ tests read that struct, so a C-only define
+    # gives the two halves of one binary different field offsets.
+    add_compile_options(-DUSE_SCHEDULER_SCALING_PTHREADS)
     set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -stdlib=libc++")
 endif()
 
