@@ -24,6 +24,7 @@ actor \nodoc\ Main is TestList
     test(_TestChdir)
     test(_TestBadChdir)
     test(_TestBadExec)
+    test(_TestWindowsEmptyEnvironment)
     test(_TestStdinWriteBuf)
     test(_TestLongRunningChild)
     test(_TestKillLongRunningChild)
@@ -381,6 +382,55 @@ class \nodoc\ iso _TestWindowsGrandchildDoesNotBlockExit is UnitTest
       h.long_test(10_000_000_000)
     else
       // Windows-only; on posix there is nothing to run here.
+      h.complete(true)
+    end
+
+class \nodoc\ iso _TestWindowsEmptyEnvironment is UnitTest
+  """
+  A child starts with an empty environment. The Windows environment block for
+  no variables is two null bytes; CreateProcess rejects a lone null.
+  """
+  fun name(): String => "process/windows-empty-environment"
+  fun exclusion_group(): String => "process-monitor"
+  fun apply(h: TestHelper) =>
+    ifdef windows then
+      let notifier =
+        object iso is ProcessNotify
+          fun ref failed(process: ProcessMonitor ref, err: ProcessError) =>
+            h.fail("failed: " + err.string())
+            h.complete(false)
+
+          fun ref dispose(process: ProcessMonitor ref,
+            child_exit_status: ProcessExitStatus)
+          =>
+            match child_exit_status
+            | Exited(0) => h.complete(true)
+            else
+              h.fail("expected Exited(0), got " + child_exit_status.string())
+              h.complete(false)
+            end
+        end
+
+      let process_auth = StartProcessAuth(h.env.root)
+      let backpressure_auth = ApplyReleaseBackpressureAuth(h.env.root)
+      let file_auth = FileAuth(h.env.root)
+      let path = FilePath(file_auth, "C:\\Windows\\System32\\cmd.exe")
+      let args: Array[String] val = ["cmd"; "/c"; "exit 0"]
+      let vars: Array[String] val = []
+
+      match StartProcess(process_auth, backpressure_auth, consume notifier,
+        path, args, vars)
+      | let pm: ProcessMonitor =>
+        pm.done_writing()
+        h.dispose_when_done(pm)
+      | let err: ProcessError =>
+        h.fail("StartProcess failed: " + err.string())
+        h.complete(false)
+      end
+      h.long_test(10_000_000_000)
+    else
+      // Windows-only: the empty environment block is a Windows CreateProcess
+      // concern.
       h.complete(true)
     end
 

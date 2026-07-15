@@ -500,14 +500,22 @@ class _ProcessWindows is _Process
     cmdline
 
   fun tag _make_environ(vars: Array[String] val): Array[U8] =>
-    var size: USize = 0
+    """
+    Build the ANSI environment block for CreateProcess: each `name=value`
+    string terminated by a null, then a final null ending the block. An empty
+    environment is two nulls -- CreateProcess rejects a block that is a lone
+    null.
+    """
+    var size: USize = if vars.size() == 0 then 2 else 1 end
     for varr in vars.values() do
       size = size + varr.size() + 1 // name=value\0
     end
-    size = size + 1 // last \0
     var environ = Array[U8](size)
     for varr in vars.values() do
       environ.append(varr)
+      environ.push(0)
+    end
+    if vars.size() == 0 then
       environ.push(0)
     end
     environ.push(0)
