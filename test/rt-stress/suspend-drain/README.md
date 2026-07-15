@@ -50,8 +50,8 @@ VmRSS read:
 
     /tmp/suspend-drain --ponyminthreads 1 --min-schedulers 2
 
-The floor is 2, not 1: polling rides a timer, and a pending timer keeps
-a second scheduler active. Any scheduler count works; more schedulers
-means more suspended owners. The polls are bounded, so a runtime bug
+The floor is 2, not 1: polling rides a timer, and every timer fire
+wakes a scheduler to run the poll, so the count never settles at 1.
+Any scheduler count works; more schedulers means more suspended owners. The polls are bounded, so a runtime bug
 that leaves the collector running shows up as a phase failure; one that
 stops the collector itself stops the poll clock with it.

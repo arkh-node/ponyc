@@ -30,8 +30,8 @@ Phases:
 
 Exit code 0 with a report on success; 1 with the failed phase on failure.
 Run with --ponyminthreads 1 so phase 2 has a floor to reach, and
---min-schedulers 2: polling rides a timer, and a pending timer keeps a
-second scheduler active, so a floor of 1 is never reached.
+--min-schedulers 2: polling rides a timer, every timer fire wakes a
+scheduler to run the poll, and so a floor of 1 is never reached.
 """
 use "cli"
 use "time"
