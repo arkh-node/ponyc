@@ -216,14 +216,19 @@ share.
 
 ### Two review notes (Low, non-blocking)
 
-- The comment in `sock_notify.c` (~485-490) oversells the IOCP-FIFO ordering
-  argument; the real backstop is the `wait()`-gated, `_Reaped`-gated reap, which
-  the adjacent defense-in-depth sentence already states. Comment nuance only.
+- The `sock_notify.c` comments that oversold the IOCP-FIFO ordering argument
+  were softened to lean on the actual backstop (the membership invariant for
+  memory safety, the idempotent `wait()`-gated reap for harmlessness). Comment
+  only; done.
 - If `pony_asio_event_create` ever returned NULL in `arm_exit_event`, the
   process handle would leak (the Linux path closes its fd unconditionally; the
-  Windows path delegates the close to the backend). Effectively unreachable
-  (`pony_asio_event_create` only returns NULL for bad flags / a missing msg_id,
-  and the monitor always has one).
+  Windows path delegates the close to the backend). Left as-is on purpose: it is
+  effectively unreachable (`pony_asio_event_create` returns NULL only for bad
+  flags / a missing msg_id, and the monitor always has one), and closing the
+  handle here would need a new `CloseHandle` FFI and a Windows-only branch that
+  can't be tested from a non-Windows machine — untested code guarding an
+  impossible case. If a real Windows run ever shows it reachable, add the
+  defensive close then.
 
 ### What to verify on Windows
 

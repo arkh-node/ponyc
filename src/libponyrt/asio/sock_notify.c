@@ -482,12 +482,14 @@ DECLARE_THREAD_FN(ponyint_asio_backend_dispatch)
         // A child exited. Its event rides in lpOverlapped. It may have been
         // unsubscribed and freed between the wait firing and now, so match it
         // against the managed list -- a pointer compare that never dereferences
-        // it -- and drop the packet if it is gone. The barrier and FIFO ordering
-        // (see ASIO_PROC_UNSUBSCRIBE) keep a freed address from matching a reused
-        // event; as defense in depth, every managed event type also treats an
-        // unexpected ASIO_READ idempotently (a proc event re-runs its gated reap
-        // probe, a pipe event does one more non-blocking read), so even a
-        // spurious delivery would be harmless.
+        // it -- and drop the packet if it is gone. Membership implies the event
+        // is still subscribed and not yet freed, because a managed event is
+        // removed from the list before it is disposed, so the send below never
+        // touches freed memory. The barrier and FIFO ordering (see
+        // ASIO_PROC_UNSUBSCRIBE) make it unlikely that a stale packet even
+        // reaches a reused address; what makes a matched stale packet harmless is
+        // idempotent handling -- a proc event re-runs its gated reap probe, a
+        // pipe event does one more non-blocking read.
         asio_event_t* ev = (asio_event_t*)entries[i].lpOverlapped;
 
         if(managed_contains(b, ev))
@@ -647,13 +649,14 @@ DECLARE_THREAD_FN(ponyint_asio_backend_dispatch)
             break;
 
           // UnregisterWaitEx with INVALID_HANDLE_VALUE blocks until any running
-          // callback has finished and lets no further callback start. It is the
-          // barrier that makes the KEY_PROC match safe: once it returns, any
-          // KEY_PROC the callback will ever post is already on the port, ahead
-          // of any packet a later reuse of this event's address could enqueue,
-          // so the stale packet's list check runs before the address is
-          // re-listed. The callback only posts to the port, so this cannot
-          // deadlock the asio thread.
+          // callback has finished and lets no further callback start. Once it
+          // returns, no callback will run again -- so the handle is safe to
+          // close below -- and any KEY_PROC the callback will ever post is
+          // already on the port. That ordering makes a stale KEY_PROC reaching a
+          // reused address unlikely; a match that does happen is caught at the
+          // KEY_PROC handler by the membership check and the idempotent send. The
+          // callback only posts to the port, so this cannot deadlock the asio
+          // thread.
           if(ev->proc_wait != NULL)
           {
             UnregisterWaitEx(ev->proc_wait, INVALID_HANDLE_VALUE);
