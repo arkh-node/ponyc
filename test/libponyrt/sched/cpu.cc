@@ -80,3 +80,18 @@ TEST(CpuTickDiffTest, PublicDiffMatchesPlainDifference)
   ASSERT_EQ(UINT64_C(0), ponyint_cpu_tick_diff(500, 500));
   ASSERT_EQ(UINT64_C(150), ponyint_cpu_tick_diff(100, 250));
 }
+
+// The sleep contract is a floor: at least the requested time passes.
+// Platform granularity can stretch the pause far past the request, so
+// no upper bound is asserted (Windows especially, ~15ms ticks).
+TEST(CpuSleepTest, SleepsAtLeastTheRequest)
+{
+  uint64_t before = ponyint_cpu_tick();
+  ponyint_cpu_sleep_ns(20 * 1000 * 1000);
+  uint64_t after = ponyint_cpu_tick();
+
+  // Ticks are cycles-or-nanoseconds by platform; 20ms in cycles is at
+  // least 20M even at 1GHz, and nanosecond platforms read 20M exactly,
+  // so 15M is a safe floor for "a real pause happened" on both.
+  ASSERT_GE(ponyint_cpu_tick_diff(before, after), UINT64_C(15000000));
+}
