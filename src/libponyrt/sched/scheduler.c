@@ -38,7 +38,10 @@ static PONY_ATOMIC(uint32_t) active_scheduler_count;
 static PONY_ATOMIC(uint32_t) active_scheduler_count_check;
 static scheduler_t* scheduler;
 static PONY_ATOMIC(bool) temporarily_disable_scheduler_scaling;
-static PONY_ATOMIC(bool) detect_quiescence;
+/// How many schedulers are active, as a gauge: adjusted by each
+/// thread at its own transitions, read by pony_active_schedulers and
+/// nothing else yet.
+static PONY_ATOMIC(uint32_t) active_scheduler_gauge;
 static PONY_ATOMIC(bool) runtime_shutdown_initiated;
 static bool use_yield;
 static mpmcq_t inject;
@@ -474,6 +477,30 @@ static void wake_suspended_threads(int32_t current_scheduler_id)
 }
 
 // handle SCHED_BLOCK message
+/// How many words the per-scheduler blocked bitmap holds.
+static size_t blocked_map_words()
+{
+  return (scheduler_count + 63) / 64;
+}
+
+#if !defined(PONY_NDEBUG) || defined(PONY_ALWAYS_ASSERT)
+/// Population count of a scheduler's blocked map. Debug-only caller;
+/// scheduler 0's map and its block_count are fed by the same message
+/// stream, so they must always agree.
+static uint32_t blocked_map_count(scheduler_t* sched)
+{
+  uint32_t count = 0;
+
+  for(size_t i = 0; i < blocked_map_words(); i++)
+  {
+    count += __pony_popcount((uint32_t)sched->blocked_map[i]);
+    count += __pony_popcount((uint32_t)(sched->blocked_map[i] >> 32));
+  }
+
+  return count;
+}
+#endif
+
 static void handle_sched_block(scheduler_t* sched)
 {
   sched->block_count++;
@@ -489,7 +516,6 @@ static void handle_sched_block(scheduler_t* sched)
   // only if there are no noisy actors subscribed with the ASIO subsystem
   // and the mutemap is empty
   if(!sched->asio_noisy &&
-    atomic_load_explicit(&detect_quiescence, memory_order_relaxed) &&
     ponyint_mutemap_size(&sched->mute_mapping) == 0 &&
     sched->block_count == scheduler_count)
   {
@@ -555,15 +581,32 @@ static bool read_msg(scheduler_t* sched, pony_actor_t* actor)
     {
       case SCHED_BLOCK:
       {
-        pony_assert(0 == sched->index);
-        handle_sched_block(sched);
+        sched->blocked_map[m->i / 64] |= (UINT64_C(1) << (m->i % 64));
+
+        if(0 == sched->index)
+        {
+          handle_sched_block(sched);
+          pony_assert(blocked_map_count(sched) == sched->block_count);
+        }
         break;
       }
 
       case SCHED_UNBLOCK:
       {
-        pony_assert(0 == sched->index);
-        handle_sched_unblock(sched);
+        sched->blocked_map[m->i / 64] &= ~(UINT64_C(1) << (m->i % 64));
+
+        if(0 == sched->index)
+        {
+          handle_sched_unblock(sched);
+          pony_assert(blocked_map_count(sched) == sched->block_count);
+        }
+        break;
+      }
+
+      case SCHED_ACTIVATE:
+      {
+        // Defined ahead of the scheduler state machine that consumes
+        // it; nothing sends it yet.
         break;
       }
 
@@ -1128,7 +1171,7 @@ static pony_actor_t* steal(scheduler_t* sched)
         // 0 and there are no noiisy actors registered
         if((sched->index > 0) || ((sched->index == 0) && !sched->asio_noisy))
         {
-          send_msg(sched->index, 0, SCHED_BLOCK, 0);
+          send_msg_all(sched->index, SCHED_BLOCK, sched->index);
           block_sent = true;
         }
 
@@ -1147,9 +1190,10 @@ static pony_actor_t* steal(scheduler_t* sched)
     }
     else
     {
-      // block sent and no work to do. We should try and suspend if we can now
-      // if we do suspend, we'll send a unblock message first to ensure cnf/ack
-      // cycle works as expected
+      // block sent and no work to do. We should try and suspend if we
+      // can now. Suspension sends no unblock: the thread stays counted
+      // as blocked while it sleeps, which is what lets the cnf/ack
+      // cycle run while threads are suspended.
 
       // make sure thread scaling order is still valid. we should never be
       // active if the active_scheduler_count isn't larger than our index.
@@ -1232,7 +1276,7 @@ static pony_actor_t* steal(scheduler_t* sched)
 
   // Only send unblock message if a corresponding block message was sent
   if(block_sent)
-    send_msg(sched->index, 0, SCHED_UNBLOCK, 0);
+    send_msg_all(sched->index, SCHED_UNBLOCK, sched->index);
 
   DTRACE3(WORK_STEAL_SUCCESSFUL, (uintptr_t)sched, (uintptr_t)victim, (uintptr_t)actor);
   return actor;
@@ -1798,6 +1842,12 @@ static void ponyint_sched_shutdown()
 #endif
   }
 
+  size_t blocked_map_size = blocked_map_words() * sizeof(uint64_t);
+
+  for(uint32_t i = 0; i < scheduler_count; i++)
+    ponyint_pool_free_size(blocked_map_size, scheduler[i].blocked_map);
+
+  atomic_store_explicit(&active_scheduler_gauge, 0, memory_order_relaxed);
   ponyint_pool_free_size(scheduler_count * sizeof(scheduler_t), scheduler);
 #ifdef USE_RUNTIMESTATS
   mem_used -= (scheduler_count * sizeof(scheduler_t));
@@ -1882,6 +1932,18 @@ pony_ctx_t* ponyint_sched_init(uint32_t threads, bool noyield, bool pin,
     * sizeof(scheduler_t)));
 #endif
   memset(scheduler, 0, scheduler_count * sizeof(scheduler_t));
+
+  atomic_store_explicit(&active_scheduler_gauge, scheduler_count,
+    memory_order_relaxed);
+
+  size_t blocked_map_size = blocked_map_words() * sizeof(uint64_t);
+
+  for(uint32_t i = 0; i < scheduler_count; i++)
+  {
+    scheduler[i].blocked_map =
+      (uint64_t*)ponyint_pool_alloc_size(blocked_map_size);
+    memset(scheduler[i].blocked_map, 0, blocked_map_size);
+  }
 
   uint32_t tracing_cpu = -1;
 
@@ -1994,7 +2056,6 @@ bool ponyint_sched_start()
   atomic_store_explicit(&pinned_actor_scheduler_suspended, false, memory_order_relaxed);
   atomic_store_explicit(&pinned_actor_scheduler_suspended_check, false, memory_order_relaxed);
 
-  atomic_store_explicit(&detect_quiescence, true, memory_order_relaxed);
 
   DTRACE0(RT_START);
   uint32_t start = 0;

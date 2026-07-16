@@ -45,7 +45,8 @@ typedef enum
   SCHED_TERMINATE = 40,
   SCHED_UNMUTE_ACTOR = 50,
   SCHED_NOISY_ASIO = 51,
-  SCHED_UNNOISY_ASIO = 52
+  SCHED_UNNOISY_ASIO = 52,
+  SCHED_ACTIVATE = 53
 } sched_msg_t;
 
 typedef struct schedulerstats_t
@@ -116,6 +117,10 @@ struct scheduler_t
 
   // These are changed primarily by the owning scheduler thread.
   alignas(64) struct scheduler_t* last_victim;
+
+  /// Which schedulers are blocked, one bit per scheduler, maintained
+  /// by this thread alone from the block/unblock broadcasts it reads.
+  uint64_t* blocked_map;
 
   pony_ctx_t ctx;
   uint32_t block_count;
