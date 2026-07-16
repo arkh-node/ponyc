@@ -39,6 +39,9 @@ actor \nodoc\ Main is TestList
     test(_TestManyStartsDoNotLeakFds)
     // state-machine invariants via the injectable seam
     test(_TestExitReportsExactlyOnce)
+    test(_TestExitSignalRetriesUntilReapable)
+    test(_TestRetryWhileDisposing)
+    test(_TestExitSignalReapErrorReportsFailed)
     test(_TestDisposeThenExit)
     test(_TestDoubleDispose)
     test(_TestNoKillAfterReap)
@@ -1243,24 +1246,35 @@ actor \nodoc\ _SpyRecorder
 class \nodoc\ _ProcessSpy is _Process
   """
   A stand-in for a real child. Records `kill()` to a recorder and returns a
-  chosen status from `wait()`. The first `wait()` (the constructor probe) sees
-  the child still running; a later `wait()` (a triggered exit) reaps.
+  chosen result from `wait()`. The first `wait()` (the constructor probe)
+  returns `_StillRunning`; a later `wait()` (a triggered exit) reaps. `lag`
+  extends the `_StillRunning` window past the probe by that many `wait()` calls,
+  standing in for waitpid trailing the OS exit notification. With `fail`, the
+  reap returns `WaitpidError` instead of the status.
   """
   let _recorder: _SpyRecorder
   let _status: ProcessExitStatus
+  let _lag: USize
+  let _fail: Bool
   var _waits: USize = 0
 
-  new create(recorder: _SpyRecorder, status: ProcessExitStatus) =>
+  new create(recorder: _SpyRecorder, status: ProcessExitStatus,
+    lag: USize = 0, fail: Bool = false)
+  =>
     _recorder = recorder
     _status = status
+    _lag = lag
+    _fail = fail
 
   fun box kill() =>
     _recorder.on_kill()
 
   fun ref wait(): _WaitResult =>
     _waits = _waits + 1
-    if _waits <= 1 then
+    if _waits <= (1 + _lag) then
       _StillRunning
+    elseif _fail then
+      WaitpidError
     else
       _recorder.on_reap()
       _status
@@ -1283,6 +1297,57 @@ class \nodoc\ _SpyNotify is ProcessNotify
 
   fun ref failed(process: ProcessMonitor ref, e: ProcessError) =>
     _recorder.on_failed()
+
+class \nodoc\ _ExpectDisposeClient is ProcessNotify
+  """
+  Completes the test when `dispose` reports the expected status. Used where the
+  reap arrives after a retry that outlives the seam's settle query, so the test
+  must wait on `dispose` itself rather than a one-shot settle.
+  """
+  let _h: TestHelper
+  let _expected: ProcessExitStatus
+
+  new iso create(h: TestHelper, expected: ProcessExitStatus) =>
+    _h = h
+    _expected = expected
+
+  fun ref dispose(process: ProcessMonitor ref, s: ProcessExitStatus) =>
+    if s == _expected then
+      _h.complete(true)
+    else
+      _h.fail("expected dispose(" + _expected.string() + "), got "
+        + s.string())
+      _h.complete(false)
+    end
+
+  fun ref failed(process: ProcessMonitor ref, e: ProcessError) =>
+    _h.fail("expected dispose, got failed(" + e.error_type.string() + ")")
+    _h.complete(false)
+
+class \nodoc\ _ExpectFailedClient is ProcessNotify
+  """
+  Completes the test when `failed` reports the expected error type. Mirrors
+  `_ExpectDisposeClient` for the reap-error path.
+  """
+  let _h: TestHelper
+  let _expected: ProcessErrorType
+
+  new iso create(h: TestHelper, expected: ProcessErrorType) =>
+    _h = h
+    _expected = expected
+
+  fun ref failed(process: ProcessMonitor ref, e: ProcessError) =>
+    if e.error_type is _expected then
+      _h.complete(true)
+    else
+      _h.fail("expected failed(" + _expected.string() + "), got "
+        + e.error_type.string())
+      _h.complete(false)
+    end
+
+  fun ref dispose(process: ProcessMonitor ref, s: ProcessExitStatus) =>
+    _h.fail("expected failed, got dispose(" + s.string() + ")")
+    _h.complete(false)
 
 primitive \nodoc\ _Spy
   fun monitor(h: TestHelper, recorder: _SpyRecorder,
@@ -1334,6 +1399,69 @@ class \nodoc\ iso _TestExitReportsExactlyOnce is UnitTest
         and (not r.backpressure_applied),
        "expected exactly one dispose of Exited(3), no kill after reap")
     })
+    h.long_test(5_000_000_000)
+
+class \nodoc\ iso _TestExitSignalRetriesUntilReapable is UnitTest
+  """
+  When the OS signals the child exited but waitpid still reports it running for
+  a few polls, the monitor retries the reap until the status appears and reports
+  the exit. Pins the retry that covers the window where waitpid trails the OS
+  exit notification (the macOS EVFILT_PROC ESRCH race).
+  """
+  fun name(): String => "process/exit-signal-retries-until-reapable"
+  fun exclusion_group(): String => "process-monitor-seam"
+  fun apply(h: TestHelper) =>
+    let recorder = _SpyRecorder
+    let bp_auth = ApplyReleaseBackpressureAuth(h.env.root)
+    // lag = 5: the probe and the first five exit-signal reaps return
+    // `_StillRunning`; the reap converges only by retrying.
+    let pm = ProcessMonitor._create(bp_auth,
+      _ExpectDisposeClient(h, Exited(4)),
+      recover iso _ProcessSpy(recorder, Exited(4), 5) end,
+      recover iso _Pipe.none() end, recover iso _Pipe.none() end,
+      recover iso _Pipe.none() end, recover iso _Pipe.none() end)
+    pm._test_trigger_exit()
+    h.long_test(5_000_000_000)
+
+class \nodoc\ iso _TestRetryWhileDisposing is UnitTest
+  """
+  dispose() runs first, moving the monitor to `_Disposing`; the exit-signal reap
+  then retries entirely within `_Disposing` and reports the exit once via
+  `dispose`. Pins that the retry converges while the monitor is disposing.
+  """
+  fun name(): String => "process/retry-while-disposing"
+  fun exclusion_group(): String => "process-monitor-seam"
+  fun apply(h: TestHelper) =>
+    let recorder = _SpyRecorder
+    let bp_auth = ApplyReleaseBackpressureAuth(h.env.root)
+    let pm = ProcessMonitor._create(bp_auth,
+      _ExpectDisposeClient(h, Exited(0)),
+      recover iso _ProcessSpy(recorder, Exited(0), 3) end,
+      recover iso _Pipe.none() end, recover iso _Pipe.none() end,
+      recover iso _Pipe.none() end, recover iso _Pipe.none() end)
+    pm.dispose()
+    pm._test_trigger_exit()
+    h.long_test(5_000_000_000)
+
+class \nodoc\ iso _TestExitSignalReapErrorReportsFailed is UnitTest
+  """
+  A reap that errors after the exit signal (waitpid fails once the retry finally
+  polls) reports `failed(WaitpidError)`. Pins the reap-error branch on the
+  exit-signal path, which the other seam tests never reach.
+  """
+  fun name(): String => "process/exit-signal-reap-error-reports-failed"
+  fun exclusion_group(): String => "process-monitor-seam"
+  fun apply(h: TestHelper) =>
+    let recorder = _SpyRecorder
+    let bp_auth = ApplyReleaseBackpressureAuth(h.env.root)
+    // lag = 2, fail = true: the probe and two exit-signal reaps return
+    // `_StillRunning`, then the reap returns `WaitpidError`.
+    let pm = ProcessMonitor._create(bp_auth,
+      _ExpectFailedClient(h, WaitpidError),
+      recover iso _ProcessSpy(recorder, Exited(0), 2 where fail = true) end,
+      recover iso _Pipe.none() end, recover iso _Pipe.none() end,
+      recover iso _Pipe.none() end, recover iso _Pipe.none() end)
+    pm._test_trigger_exit()
     h.long_test(5_000_000_000)
 
 class \nodoc\ iso _TestDisposeThenExit is UnitTest

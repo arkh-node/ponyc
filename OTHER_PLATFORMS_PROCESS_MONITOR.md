@@ -41,8 +41,9 @@ ProcessError)` — all fallible setup happens before the actor exists.
 
 Pony (`packages/process/`):
 - `process_monitor.pony` — the `StartProcess` factory, the three-state actor
-  (`_Running`/`_Disposing`/`_Reaped`), the reap edge and drain, and the
-  exit-event routing.
+  (`_Running`/`_Disposing`/`_Reaped`), the reap edge and drain, the exit-event
+  routing, and the exit-signal reap retry (`_reap_on_exit_signal`/`_reap_again`)
+  that covers `waitpid` trailing the OS exit notification.
 - `_process.pony` — the `_Process` interface (`kill`/`wait`/`arm_exit_event`/
   `close_exit_source`), `_ProcessPosix` (pidfd on Linux, pid for kqueue),
   `_ProcessWindows`, `_WaitPidStatus`.
@@ -50,11 +51,12 @@ Pony (`packages/process/`):
 - `process_error.pony` — new `ExecutableNotFound`, `UnsupportedKernel`;
   docstrings on all variants.
 - `process_notify.pony`, `process.pony` — docstrings + example for the factory.
-- `_test.pony` — 26 tests.
+- `_test.pony` — 31 tests.
 
 Runtime (`src/libponyrt/`):
 - `asio/asio.h` — `ASIO_PROC = 1 << 5`.
-- `asio/kqueue.c` — `EVFILT_PROC` handling in subscribe/dispatch/unsubscribe.
+- `asio/kqueue.c` — `EVFILT_PROC` handling in subscribe/dispatch/unsubscribe,
+  and the ESRCH-on-subscribe → `ASIO_READ` mapping for an already-exited child.
 - `lang/process.c` + `.h` — `ponyint_pidfd_open` (Linux only).
 - `packages/builtin/asio_event.pony` — `AsioEvent.proc()` mirrors `ASIO_PROC`.
 
@@ -72,9 +74,13 @@ Other:
    probe (covers a child that exited before the event was armed — asio
    subscription is synchronous, so the probe closes the race on every platform).
 3. When the exit event fires, `_event_notify` matches `event is _exit_event`
-   and calls `_reap_if_exited()`, which calls `_child.wait()` (non-blocking
-   reap) and, on a status, runs the reap edge `_do_reap`: drain the pipes,
-   close everything (`_close_all` → `_close_exit_source`), `notifier.dispose`.
+   and calls `_reap_on_exit_signal(0)`, which calls `_child.wait()` (non-blocking
+   reap) and, on a status, runs the reap edge `_do_reap`: drain the pipes, close
+   everything (`_close_all` → `_close_exit_source`), `notifier.dispose`. If
+   `wait()` still reports the child running (the OS exit signal can lead
+   `waitpid`), it retries via the `_reap_again` self-message, bounded by
+   `_reap_retry_cap`. The start-up probe in step 2 uses `_reap_if_exited`, which
+   does not retry — there the child may genuinely still be running.
 4. The reap is gated on `_state is _Reaped`, so it runs at most once. That gate
    is load-bearing — removing it double-reaps and aborts the runtime.
 
@@ -148,6 +154,16 @@ does `EV_DELETE` (ENOENT after a fired one-shot is ignored via EV_RECEIPT). The
 Pony side is `_ProcessPosix.arm_exit_event`'s `bsd or osx` branch, which creates
 the event with `AsioEvent.proc()` and fd = `pid.u32()`.
 
+There is a second kqueue path, added after the macOS run below found the race it
+handles: if the child has already exited by the time the asio thread registers
+the filter, `EV_ADD EVFILT_PROC` fails with ESRCH — the kernel has no process to
+watch. That is the exit, not a failure to watch for it, so the subscribe maps an
+ESRCH receipt on an `ASIO_PROC` event to `ASIO_READ` (the same signal
+`NOTE_EXIT` delivers) instead of `ASIO_ERROR`. The monitor then retries its
+non-blocking reap (`_reap_on_exit_signal` → `_reap_again`), because `waitpid`
+can briefly still report the exiting child as running after the kernel has
+signalled the exit.
+
 What to verify:
 - The build compiles the kqueue path.
 - The whole process suite passes, especially the posix-only tests
@@ -162,12 +178,29 @@ What to verify:
 The kqueue `EPIPE`-on-macOS handling already exists in `kevent_receipt_has_error`
 — unrelated to this change, but be aware of it.
 
-**FreeBSD is verified.** All 26 process tests pass on FreeBSD 15.1 (clang
-19.1.7), stable across repeated runs — so the kqueue `EVFILT_PROC` exit
-detection works, including the #5764 grandchild and #5748 stdin-open cases.
-macOS runs the same `EVFILT_PROC` code, so this is strong evidence for macOS
-too; a real macOS run (or `pr.yml`'s macOS job, once the PR is marked ready —
-draft PRs skip it) is still worth doing to be sure.
+**macOS is verified, after a fix.** The assumption that macOS would pass because
+it runs the same `EVFILT_PROC` code as FreeBSD was wrong. macOS returns ESRCH
+from `EV_ADD EVFILT_PROC` for a child that exits the instant it is forked (the
+`BadExec`/`BadChdir` tests), which the old code turned into `ASIO_ERROR` and a
+non-draining error path that lost the child's exec/chdir error byte and reported
+`WaitpidError` — an intermittent failure that surfaced within a few full-suite
+runs. The ESRCH→`ASIO_READ` mapping plus the reap retry (above) fix it. With the
+fix, 31 process tests pass, stable across 20 full-suite runs, and the whole
+stdlib suite is green. FreeBSD did **not** show this race in the pre-fix run,
+which is why it was missed.
+
+**FreeBSD needs a re-run against the fix, and one specific probe.** The earlier
+FreeBSD result — all 26 process tests pass on FreeBSD 15.1 (clang 19.1.7),
+stable across repeated runs — was against the code *before* this fix. Re-run the
+suite against the fixed code. The fix maps only ESRCH, because that is the errno
+macOS returns; a BSD kernel could return a different errno for the same
+instant-fork race, in which case it would fall through to the old non-retrying
+error path and the bug would remain there. So, on each BSD, probe explicitly:
+does `EV_ADD EVFILT_PROC` for a child that exits the instant it forks return an
+error, and if so what errno? If it is ESRCH, the fix already covers it. If it is
+another errno, extend the ESRCH branch in `kqueue.c` with that verified value —
+do not guess. If the race does not occur there at all (registration wins the
+race), nothing more is needed.
 
 One portability fix came out of the FreeBSD run: the fd-leak test used
 `/bin/true`, which is Linux-only; it now uses `/usr/bin/true`, which exists on
@@ -257,7 +290,10 @@ For each platform: whether it builds, which tests pass/fail (with output), and
 whether anything hangs or spins. Keep the time-discrimination discipline for any
 new exit-detection test.
 
-Status so far: Linux and FreeBSD (15.1) both pass all 28 process tests at the
-current tip, re-verified after the Windows native-event commits. macOS runs the
-same kqueue `EVFILT_PROC` code as FreeBSD, so it is expected to pass; a real run
-is the remaining confirmation. Windows needs its first real build+test run.
+Status so far: macOS is verified after the ESRCH fix — 31 process tests pass,
+stable across 20 full-suite runs, full stdlib green. Linux passes all process
+tests at the current tip. FreeBSD (15.1) passed the *pre-fix* code (26 tests
+then); it needs a re-run against the fix, with the explicit ESRCH-errno probe
+described in the macOS/BSD section — the instant-fork race may or may not occur
+there, and if it does with a non-ESRCH errno the fix must be extended. Windows
+needs its first real build+test run.

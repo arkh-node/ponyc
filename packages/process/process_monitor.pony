@@ -198,6 +198,13 @@ actor ProcessMonitor is AsioEventNotify
   var _read_len: USize = 0
   var _expect: USize = 0
 
+  // Backstop for the exit-signal reap retry. Once the OS signals that the child
+  // exited, the child is a zombie we own, so waitpid will collect it and the
+  // retry converges. The cap only guards a non-convergence that should never
+  // occur — a kernel that signals the exit but never lets waitpid reap — where
+  // we surrender to WaitpidError rather than spin forever.
+  let _reap_retry_cap: U32 = 100_000
+
   embed _pending: List[(ByteSeq, USize)] = _pending.create()
   var _done_writing: Bool = false
   var _backpressure_applied: Bool = false
@@ -331,7 +338,7 @@ actor ProcessMonitor is AsioEventNotify
       elseif AsioEvent.errored(flags) then
         _on_exit_event_error()
       else
-        _reap_if_exited()
+        _reap_on_exit_signal(0)
       end
       return
     end
@@ -373,8 +380,10 @@ actor ProcessMonitor is AsioEventNotify
 
   fun ref _reap_if_exited() =>
     """
-    Reap the child if it has exited. Gated on state so the reap runs at most
-    once: a duplicate exit event, or a probe after the reap, is a no-op.
+    Proactive start-up reap: the child may have exited before the exit event was
+    armed. Gated on state so it runs at most once. If the child has not exited,
+    do nothing — the exit signal will arrive and drive the reap through
+    `_reap_on_exit_signal`.
     """
     if _state is _Reaped then
       return
@@ -386,8 +395,40 @@ actor ProcessMonitor is AsioEventNotify
     | WaitpidError =>
       _do_reap_error()
     | _StillRunning =>
-      None // spurious; stay in the current state and wait for the real exit
+      None // child still running; the exit signal will drive the reap
     end
+
+  fun ref _reap_on_exit_signal(attempt: U32) =>
+    """
+    Reap after the OS signalled that the child exited (a real exit event, or the
+    ESRCH-synthesized one on kqueue). Gated on state so it runs at most once.
+    `waitpid` can briefly still report the child as running, because the OS exit
+    notification arrives ahead of waitpid; on `_StillRunning` retry through a
+    self-message, so the reap never blocks a scheduler thread, bounded by
+    `_reap_retry_cap`.
+    """
+    if _state is _Reaped then
+      return
+    end
+
+    match \exhaustive\ _child.wait()
+    | let status: ProcessExitStatus =>
+      _do_reap(status)
+    | WaitpidError =>
+      _do_reap_error()
+    | _StillRunning =>
+      if attempt < _reap_retry_cap then
+        _reap_again(attempt + 1)
+      else
+        _do_reap_error()
+      end
+    end
+
+  be _reap_again(attempt: U32) =>
+    """
+    One yielding hop of the exit-signal reap retry (see `_reap_on_exit_signal`).
+    """
+    _reap_on_exit_signal(attempt)
 
   fun ref _do_reap(status: ProcessExitStatus) =>
     """
@@ -665,7 +706,7 @@ actor ProcessMonitor is AsioEventNotify
     the chosen status, driving the reap through the same gated path the real
     event uses.
     """
-    _reap_if_exited()
+    _reap_on_exit_signal(0)
 
   be _test_query_backpressure(p: Promise[Bool]) =>
     """

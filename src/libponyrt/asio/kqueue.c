@@ -15,6 +15,7 @@
 #include <unistd.h>
 #include <stdio.h>
 #include <signal.h>
+#include <errno.h>
 
 #if defined(PLATFORM_IS_DRAGONFLY)
 typedef u_short kevent_flag_t;
@@ -356,6 +357,7 @@ PONY_API void pony_asio_event_subscribe(asio_event_t* ev)
 
   struct kevent event[4];
   int i = 0;
+  int proc_index = -1;
 
   kevent_flag_t flags = ev->flags & ASIO_ONESHOT ? EV_ONESHOT : EV_CLEAR;
   if(ev->flags & ASIO_READ)
@@ -412,6 +414,7 @@ PONY_API void pony_asio_event_subscribe(asio_event_t* ev)
     // Watch for the process whose pid is ev->fd to exit. One-shot: a process
     // exits once. This is how the process package detects a child's exit on
     // kqueue platforms, the counterpart to the pidfd read event on Linux.
+    proc_index = i;
     EV_SET(&event[i], ev->fd, EVFILT_PROC,
       EV_ADD | EV_RECEIPT | EV_ONESHOT, NOTE_EXIT, 0, ev);
     i++;
@@ -420,7 +423,21 @@ PONY_API void pony_asio_event_subscribe(asio_event_t* ev)
   struct kevent results[4];
   int rc = kevent(b->kq, event, i, results, i, NULL);
 
-  if((rc == -1) || kevent_receipt_has_error(results, i))
+  if((proc_index >= 0) && (rc > proc_index) &&
+    (results[proc_index].data == ESRCH))
+  {
+    // ESRCH when adding the exit filter means the child is already gone: the
+    // kernel reports no-such-process for a pid that has begun exiting. That is
+    // the exit itself, not a failure to watch for it, so deliver it as the same
+    // read the NOTE_EXIT dispatch delivers and let the owner reap. We read the
+    // PROC receipt by its own change index, not results[0], so the check holds
+    // wherever the PROC change sits in the list. (rc == -1 is a failure of the
+    // kevent call itself and leaves results[] unwritten; rc > proc_index
+    // excludes it, and it still routes to ASIO_ERROR below.)
+    ev->readable = true;
+    pony_asio_event_send(ev, ASIO_READ, 0);
+  }
+  else if((rc == -1) || kevent_receipt_has_error(results, i))
     pony_asio_event_send(ev, ASIO_ERROR, 0);
 
   if(ev->fd == STDIN_FILENO)

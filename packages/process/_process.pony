@@ -164,9 +164,10 @@ type ProcessExitStatus is (Exited | Signaled)
 
 primitive _StillRunning
   """
-  The result of a non-blocking reap when the child has not exited. The exit
-  event tells us the child exited, so a reap that sees `_StillRunning` is a
-  spurious wakeup: stay in the current state and wait for the real exit.
+  The result of a non-blocking reap that found no exit to collect. From the
+  start-up probe this means the child is still running. After an exit signal it
+  means `waitpid` has not yet caught up to the OS's exit notification. What each
+  caller does with it — wait, retry, or report failure — is the caller's own.
   """
 
 type _WaitResult is (ProcessExitStatus | WaitpidError | _StillRunning)
